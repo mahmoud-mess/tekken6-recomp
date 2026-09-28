@@ -29,5 +29,4 @@ belongs under `generated/default/` and is ignored by Git.
 - `patches/rexglue/`: SDK patch series against the pinned SDK base.
 - `third_party/rexglue-sdk/`: upstream SDK submodule.
 
-There is no release license yet. Third-party and game-derived material must be
-reviewed before public release.
+
