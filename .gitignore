@@ -1,0 +1,16 @@
+# User-provided game image and extracted game data
+*.iso
+/game/
+/user/
+
+# Code generated from the user's XEX and all local build outputs
+/generated/default/*
+!/generated/default/.gitkeep
+/build/
+/out/
+
+# Local logs and editor files
+/logs/
+*.log
+.DS_Store
+Thumbs.db

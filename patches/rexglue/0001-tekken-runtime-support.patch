@@ -1,0 +1,3203 @@
+diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
+index f8949ca..a4d88ed 100644
+--- a/include/rex/audio/sdl/sdl_audio_driver.h
++++ b/include/rex/audio/sdl/sdl_audio_driver.h
+@@ -11,6 +11,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++#include <thread>
+ #include <mutex>
+ #include <queue>
+ #include <stack>
+@@ -40,6 +42,11 @@ class SDLAudioDriver : public AudioDriver {
+   SDL_AudioStream* sdl_stream_ = nullptr;
+   bool sdl_initialized_ = false;
+   uint8_t sdl_device_channels_ = 0;
++  std::atomic_bool trace_stop_{false};
++  std::atomic<uint64_t> trace_submitted_frames_{0};
++  std::atomic<uint64_t> trace_consumed_frames_{0};
++  std::atomic<uint64_t> trace_underrun_blocks_{0};
++  std::thread trace_thread_;
+ 
+   static const uint32_t frame_frequency_ = 48000;
+   static const uint32_t frame_channels_ = 6;
+diff --git a/include/rex/codegen/function_types.h b/include/rex/codegen/function_types.h
+index 8c6772d..925ffee 100644
+--- a/include/rex/codegen/function_types.h
++++ b/include/rex/codegen/function_types.h
+@@ -247,6 +247,7 @@ struct JumpTable {
+   uint32_t bctrAddress;           // Address of bctr instruction
+   uint32_t tableAddress;          // Address of jump table data
+   uint8_t indexRegister;          // Register holding switch index
++  uint32_t selectorMask = 0xFFFFFFFF;  // Optional mask applied to the index before dispatch
+   std::vector<uint32_t> targets;  // Resolved case targets (internal labels)
+ };
+ 
+diff --git a/include/rex/filesystem/devices/host_path_device.h b/include/rex/filesystem/devices/host_path_device.h
+index 48100be..6dab0ad 100644
+--- a/include/rex/filesystem/devices/host_path_device.h
++++ b/include/rex/filesystem/devices/host_path_device.h
+@@ -37,6 +37,12 @@ class HostPathDevice : public Device {
+   bool allow_share_delete() const { return allow_share_delete_; }
+   const std::filesystem::path& host_path() const { return host_path_; }
+ 
++  // Some title boot code opens a mounted directory as a raw volume handle
++  // and reads the volume's sector header from that handle.  Keep this opt-in
++  // so the normal extracted-tree device remains an ordinary HostPathDevice.
++  void EnableRootSectorProbe() { root_sector_probe_enabled_ = true; }
++  bool root_sector_probe_enabled() const { return root_sector_probe_enabled_; }
++
+   const std::string& name() const override { return name_; }
+   uint32_t attributes() const override { return 0; }
+   uint32_t component_name_max_length() const override { return 255; }
+@@ -54,6 +60,7 @@ class HostPathDevice : public Device {
+   std::unique_ptr<Entry> root_entry_;
+   bool read_only_;
+   bool allow_share_delete_;
++  bool root_sector_probe_enabled_ = false;
+ };
+ 
+ }  // namespace rex::filesystem
+diff --git a/include/rex/filesystem/devices/host_path_file.h b/include/rex/filesystem/devices/host_path_file.h
+index 789315c..62990bf 100644
+--- a/include/rex/filesystem/devices/host_path_file.h
++++ b/include/rex/filesystem/devices/host_path_file.h
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <span>
++#include <array>
+ #include <string>
+ 
+ #include <rex/filesystem.h>
+@@ -24,7 +25,8 @@ class HostPathEntry;
+ class HostPathFile : public File {
+  public:
+   HostPathFile(uint32_t file_access, HostPathEntry* entry,
+-               std::unique_ptr<rex::filesystem::FileHandle> file_handle);
++               std::unique_ptr<rex::filesystem::FileHandle> file_handle,
++               bool root_sector_probe = false);
+   ~HostPathFile() override;
+ 
+   void Destroy() override;
+@@ -35,7 +37,16 @@ class HostPathFile : public File {
+   X_STATUS SetLength(size_t length) override;
+ 
+  private:
++  static constexpr size_t kJoshOffset = 0x800;
++  static constexpr size_t kJoshSize = 0x400;
++
+   std::unique_ptr<rex::filesystem::FileHandle> file_handle_;
++  bool root_sector_probe_ = false;
++  // A root-sector probe is a virtual, per-handle sector rather than a host
++  // file.  Keep writes in memory so the retail read/modify/write bootstrap
++  // observes its own data on subsequent reads without mutating the extracted
++  // game tree.
++  std::array<uint8_t, kJoshSize> root_sector_{};
+ };
+ 
+ }  // namespace rex::filesystem
+diff --git a/include/rex/filesystem/devices/null_device.h b/include/rex/filesystem/devices/null_device.h
+index 4068d34..64eb8d5 100644
+--- a/include/rex/filesystem/devices/null_device.h
++++ b/include/rex/filesystem/devices/null_device.h
+@@ -21,7 +21,9 @@ class NullEntry;
+ 
+ class NullDevice : public Device {
+  public:
+-  NullDevice(const std::string& mount_path, const std::initializer_list<std::string>& null_paths);
++  NullDevice(const std::string& mount_path,
++             const std::initializer_list<std::string>& null_paths,
++             uint32_t sectors_per_allocation_unit = 0x80);
+   ~NullDevice() override;
+ 
+   bool Initialize() override;
+@@ -37,9 +39,9 @@ class NullDevice : public Device {
+   uint32_t total_allocation_units() const override { return 0x10; }
+   uint32_t available_allocation_units() const override { return 0x10; }
+ 
+-  // STFC/cache code seems to require the product of the next two to equal
+-  // 0x10000
+-  uint32_t sectors_per_allocation_unit() const override { return 0x80; }
++  uint32_t sectors_per_allocation_unit() const override {
++    return sectors_per_allocation_unit_;
++  }
+ 
+   // STFC requires <= 0x1000
+   uint32_t bytes_per_sector() const override { return 0x200; }
+@@ -48,6 +50,7 @@ class NullDevice : public Device {
+   std::string name_;
+   std::unique_ptr<Entry> root_entry_;
+   std::vector<std::string> null_paths_;
++  uint32_t sectors_per_allocation_unit_ = 0x80;
+ };
+ 
+ }  // namespace rex::filesystem
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4d85a2b..f27bfcc 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -95,6 +95,12 @@ class SharedMemory {
+   // regions in those pages.
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+ 
++  // Temporary read-only inspection hook for diagnosing guest resources. This
++  // intentionally exposes no mutation or ownership of the backing memory.
++  const uint8_t* DebugTranslatePhysical(uint32_t address) const {
++    return memory_.TranslatePhysical<const uint8_t*>(address);
++  }
++
+  protected:
+   SharedMemory(memory::Memory& memory);
+   // Call in implementation-specific initialization.
+diff --git a/include/rex/runtime.h b/include/rex/runtime.h
+index 34f226c..6d68276 100644
+--- a/include/rex/runtime.h
++++ b/include/rex/runtime.h
+@@ -71,6 +71,11 @@ struct RuntimeConfig {
+   std::function<std::unique_ptr<system::IAudioSystem>(runtime::FunctionDispatcher*)> audio_factory;
+   std::function<std::unique_ptr<system::IInputSystem>(bool tool_mode)> input_factory;
+   std::function<void(Runtime*, system::KernelState*)> kernel_init;
++  // Geometry reported by the synthetic raw-disk device used for cache/
++  // partition probes.  The Xenia-compatible default is 0x80 sectors per
++  // allocation unit (0x10000 bytes with 0x200-byte sectors); titles may
++  // override this when their bootstrap checks a different cache geometry.
++  uint32_t null_device_sectors_per_allocation_unit = 0x80;
+   bool tool_mode = false;
+ };
+ 
+@@ -192,6 +197,7 @@ class Runtime {
+   ui::Window* display_window_ = nullptr;
+   ui::ImGuiDrawer* imgui_drawer_ = nullptr;
+   bool tool_mode_ = false;
++  uint32_t null_device_sectors_per_allocation_unit_ = 0x80;
+   PPCCodegenFlags codegen_flags_{};
+   bool setup_complete_ = false;
+ 
+diff --git a/include/rex/system/xevent.h b/include/rex/system/xevent.h
+index e81df52..9baff47 100644
+--- a/include/rex/system/xevent.h
++++ b/include/rex/system/xevent.h
+@@ -39,6 +39,10 @@ class XEvent : public XObject {
+   int32_t Reset();
+   void Clear();
+ 
++  // Diagnostic identity for correlating guest event handles with the host
++  // wait object in bounded Tekken startup traces.
++  rex::thread::WaitHandle* TraceWaitHandle() const { return event_.get(); }
++
+   bool Save(stream::ByteStream* stream) override;
+   static object_ref<XEvent> Restore(KernelState* kernel_state, stream::ByteStream* stream);
+ 
+diff --git a/include/rex/system/xfile.h b/include/rex/system/xfile.h
+index 6063f3c..b592a38 100644
+--- a/include/rex/system/xfile.h
++++ b/include/rex/system/xfile.h
+@@ -13,6 +13,7 @@
+ #include <string>
+ #include <filesystem>
+ #include <mutex>
++#include <vector>
+ 
+ #include <rex/filesystem/device.h>
+ #include <rex/filesystem/entry.h>
+@@ -25,6 +26,16 @@
+ 
+ namespace rex::system {
+ 
++// A guest-visible logical DATA stream segment backed by a decoded XMem-TD
++// bank.  The runtime keeps these per XFile because the same DATA*.BIN can be
++// opened more than once for unrelated logical substreams.
++struct Tekken6TdVirtualSegment {
++  uint64_t logical_start = 0;
++  uint64_t decoded_start = 0;
++  uint64_t length = 0;
++  uint32_t index_entry = 0;
++};
++
+ // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_directory_information
+ class X_FILE_DIRECTORY_INFORMATION {
+  public:
+@@ -137,6 +148,10 @@ class XFile : public XObject {
+   std::mutex completion_port_lock_;
+   std::vector<std::pair<uint32_t, object_ref<XIOCompletion>>> completion_ports_;
+ 
++  // Populated only by the opt-in IDX-aware TD bridge.  The normal XFile path
++  // remains unchanged, and segments are never used for non-Tekken files.
++  std::vector<Tekken6TdVirtualSegment> tekken6_td_segments_;
++
+   // TODO(benvanik): create flags, open state, etc.
+ 
+   uint64_t position_ = 0;
+diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
+index 0a43f07..4d65d8a 100644
+--- a/include/rex/system/xobject.h
++++ b/include/rex/system/xobject.h
+@@ -181,6 +181,10 @@ class XObject {
+     (void)stream;
+     return false;
+   }
++
++  // Diagnostic identity for correlating guest object handles with host waits.
++  rex::thread::WaitHandle* TraceWaitHandle() { return GetWaitHandle(); }
++
+   static object_ref<XObject> Restore(KernelState* kernel_state, Type type,
+                                      stream::ByteStream* stream);
+ 
+diff --git a/include/rex/ui/d3d12/d3d12_api.h b/include/rex/ui/d3d12/d3d12_api.h
+index d0e7252..d558846 100644
+--- a/include/rex/ui/d3d12/d3d12_api.h
++++ b/include/rex/ui/d3d12/d3d12_api.h
+@@ -32,4 +32,15 @@
+ #include <dxcapi.h>
+ #include "DxbcConverter.h"
+ 
++#ifdef __MINGW32__
++// The vendored DXC headers provide MSVC UUID attributes but not MinGW's
++// __mingw_uuidof specializations used by IID_PPV_ARGS.
++__CRT_UUID_DECL(IDxbcConverter, 0x5f956ed5, 0x78d1, 0x4b15,
++                0x82, 0x47, 0xf7, 0x18, 0x76, 0x14, 0xa0, 0x41)
++__CRT_UUID_DECL(IDxcCompiler, 0x8c210bf3, 0x011f, 0x4422,
++                0x8d, 0x70, 0x6f, 0x9a, 0xcb, 0x8d, 0xb6, 0x17)
++__CRT_UUID_DECL(IDxcUtils, 0x4605c4cb, 0x2019, 0x492a,
++                0xad, 0xa4, 0x65, 0xf2, 0x0b, 0xb7, 0xd6, 0x7f)
++#endif
++
+ // clang-format on
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..4bcf6f3 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,7 +11,10 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
++#include <cstdlib>
+ #include <cstring>
++#include <thread>
+ 
+ #include <rex/assert.h>
+ #include <rex/audio/conversion.h>
+@@ -106,6 +109,54 @@ bool SDLAudioDriver::Initialize() {
+     return false;
+   }
+ 
++  if (const char* trace_audio = std::getenv("TEKKEN6_TRACE_AUDIO");
++      trace_audio && std::strcmp(trace_audio, "0") != 0) {
++    trace_stop_.store(false, std::memory_order_relaxed);
++    trace_submitted_frames_.store(0, std::memory_order_relaxed);
++    trace_consumed_frames_.store(0, std::memory_order_relaxed);
++    trace_underrun_blocks_.store(0, std::memory_order_relaxed);
++    trace_thread_ = std::thread([this] {
++      uint64_t last_submitted = 0;
++      uint64_t last_consumed = 0;
++      uint64_t last_underruns = 0;
++      const auto started = std::chrono::steady_clock::now();
++      while (!trace_stop_.load(std::memory_order_relaxed)) {
++        std::this_thread::sleep_for(std::chrono::seconds(1));
++        if (trace_stop_.load(std::memory_order_relaxed)) break;
++        size_t guest_queued_frames = 0;
++        {
++          std::unique_lock<std::mutex> guard(frames_mutex_);
++          guest_queued_frames = frames_queued_.size();
++        }
++        const uint64_t submitted = trace_submitted_frames_.load(std::memory_order_relaxed);
++        const uint64_t consumed = trace_consumed_frames_.load(std::memory_order_relaxed);
++        const uint64_t underruns = trace_underrun_blocks_.load(std::memory_order_relaxed);
++        const int stream_queued_bytes = sdl_stream_ ? SDL_GetAudioStreamQueued(sdl_stream_) : -1;
++        const double guest_queue_ms = 1000.0 * guest_queued_frames * channel_samples_ /
++                                      frame_frequency_;
++        const double stream_queue_ms = stream_queued_bytes >= 0
++                                           ? 1000.0 * stream_queued_bytes /
++                                                 (sizeof(float) *
++                                                  std::max<uint8_t>(sdl_device_channels_, 1) *
++                                                  frame_frequency_)
++                                           : -1.0;
++        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                    std::chrono::steady_clock::now() - started)
++                                    .count();
++        REXAPU_INFO(
++            "T6 audio progress t+{}ms submitted={} (+{}) consumed={} (+{}) guest_queue={} "
++            "({:.1f}ms) SDL_queue_bytes={} ({:.1f}ms) underrun_blocks={} (+{})",
++            elapsed_ms, submitted, submitted - last_submitted, consumed,
++            consumed - last_consumed, guest_queued_frames, guest_queue_ms,
++            stream_queued_bytes, stream_queue_ms, underruns, underruns - last_underruns);
++        last_submitted = submitted;
++        last_consumed = consumed;
++        last_underruns = underruns;
++      }
++    });
++    REXAPU_INFO("T6 audio progress trace enabled (1s cadence)");
++  }
++
+   return true;
+ }
+ 
+@@ -134,11 +185,16 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   {
+     std::unique_lock<std::mutex> guard(frames_mutex_);
+     frames_queued_.push(output_frame);
++    trace_submitted_frames_.fetch_add(1, std::memory_order_relaxed);
+     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
+   }
+ }
+ 
+ void SDLAudioDriver::Shutdown() {
++  trace_stop_.store(true, std::memory_order_relaxed);
++  if (trace_thread_.joinable()) {
++    trace_thread_.join();
++  }
+   if (sdl_stream_) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+@@ -182,6 +238,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+     static uint32_t sdl_callback_count = 0;
+     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+     if (driver->frames_queued_.empty()) {
++      driver->trace_underrun_blocks_.fetch_add(1, std::memory_order_relaxed);
+       if (sdl_callback_count < 10) {
+         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
+         sdl_callback_count++;
+@@ -221,6 +278,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+ 
+       auto ret = driver->semaphore_->Release(1, nullptr);
+       assert_true(ret);
++      driver->trace_consumed_frames_.fetch_add(1, std::memory_order_relaxed);
+       additional_amount -= len;
+     }
+   }
+diff --git a/src/codegen/builders/control_flow.cpp b/src/codegen/builders/control_flow.cpp
+index 26957fc..f86b31f 100644
+--- a/src/codegen/builders/control_flow.cpp
++++ b/src/codegen/builders/control_flow.cpp
+@@ -125,7 +125,11 @@ bool build_bctr(BuilderContext& ctx) {
+   }
+ 
+   if (jt) {
+-    ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
++    if (jt->selectorMask == 0xFFFFFFFF) {
++      ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
++    } else {
++      ctx.println("\tswitch ({}.u32 & 0x{:08X}) {{", ctx.r(jt->indexRegister), jt->selectorMask);
++    }
+ 
+     for (size_t i = 0; i < jt->targets.size(); i++) {
+       ctx.println("\tcase {}:", i);
+diff --git a/src/codegen/config.cpp b/src/codegen/config.cpp
+index 5da54a0..60cb495 100644
+--- a/src/codegen/config.cpp
++++ b/src/codegen/config.cpp
+@@ -264,6 +264,7 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+ 
+       auto address_opt = (*table)["address"].value<uint32_t>();
+       auto register_opt = (*table)["register"].value<uint32_t>();
++      auto selector_mask_opt = (*table)["selector_mask"].value<uint32_t>();
+       auto labels_array = (*table)["labels"].as_array();
+ 
+       if (!address_opt) {
+@@ -283,6 +284,7 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+       jt.bctrAddress = *address_opt;
+       jt.tableAddress = 0;
+       jt.indexRegister = static_cast<uint8_t>(*register_opt);
++      jt.selectorMask = selector_mask_opt.value_or(0xFFFFFFFF);
+ 
+       for (auto& label : *labels_array) {
+         if (auto label_val = label.value<int64_t>()) {
+diff --git a/src/codegen/function_scanner.cpp b/src/codegen/function_scanner.cpp
+index d7ba519..a8a272b 100644
+--- a/src/codegen/function_scanner.cpp
++++ b/src/codegen/function_scanner.cpp
+@@ -1774,9 +1774,12 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
+       REXCODEGEN_TRACE(
+           "detectJumpTable: bctr=0x{:08X} entry[{}] target=0x{:08X} < funcStart=0x{:08X}", bctrAddr,
+           i, target, funcStart);
+-      if (jt.targets.empty())
+-        return std::nullopt;
+-      break;
++      // A table that begins with in-function targets and then reaches an
++      // earlier function cannot be safely represented as a local switch.
++      // Keeping the prefix would silently turn the remaining valid selectors
++      // into a generated default trap. Let bctr use the computed CTR target
++      // unless the table can be modeled in full.
++      return std::nullopt;
+     }
+ 
+     // Validate target points to valid code, not null padding
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..af4fcad 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -19,8 +19,11 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <cstddef>
+ #include <ctime>
+ #include <deque>
++#include <cstdlib>
+ #include <limits>
+ #include <memory>
++#include <condition_variable>
++#include <mutex>
+ 
+ #include <pthread.h>
+ #include <semaphore.h>
+@@ -64,6 +67,16 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ 
+ namespace rex::thread {
+ 
++namespace {
++// Bound the contention path in WaitMultiple.  The all-or-nothing trylock
++// loop is particularly easy to turn into a hot spin when the SDL audio
++// callback releases one of the semaphores being waited on.
++std::mutex g_wait_notify_mutex;
++std::condition_variable g_wait_notify_cv;
++
++bool ShouldTraceEventHandoff();
++}  // namespace
++
+ #if REX_PLATFORM_ANDROID
+ // May be null if no dynamically loaded functions are required.
+ static void* android_libc_;
+@@ -367,7 +380,12 @@ class PosixConditionBase {
+ 
+       if (!all_locked) {
+         locks.clear();
+-        std::this_thread::yield();
++        if (std::getenv("TEKKEN6_LEGACY_EVENT_WAIT") != nullptr) {
++          std::this_thread::yield();
++        } else {
++          std::unique_lock<std::mutex> notify_lock(g_wait_notify_mutex);
++          g_wait_notify_cv.wait_for(notify_lock, std::chrono::microseconds(200));
++        }
+         continue;
+       }
+ 
+@@ -448,8 +466,21 @@ class PosixCondition<Event> : public PosixConditionBase {
+ 
+   bool Signal() override {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
++    const bool was_signaled = signal_;
+     signal_ = true;
+-    cond_.notify_all();
++    // Windows auto-reset events release one waiter. Waking every waiter here
++    // lets competing guest SignalAndWait loops race to consume the same signal
++    // and can starve the queue worker. Manual-reset events still wake all.
++    if (manual_reset_ || std::getenv("TEKKEN6_LEGACY_EVENT_WAIT") != nullptr) {
++      cond_.notify_all();
++    } else {
++      cond_.notify_one();
++    }
++    if (ShouldTraceEventHandoff()) {
++      REXLOG_INFO("[Tekken6 event] set event={} tid={} prior={} manual={}",
++                  static_cast<const void*>(this), current_thread_system_id(), was_signaled,
++                  manual_reset_);
++    }
+     return true;
+   }
+ 
+@@ -461,6 +492,10 @@ class PosixCondition<Event> : public PosixConditionBase {
+  private:
+   inline bool signaled() const override { return signal_; }
+   inline void post_execution() override {
++    if (ShouldTraceEventHandoff()) {
++      REXLOG_INFO("[Tekken6 event] consume event={} tid={} manual={}",
++                  static_cast<const void*>(this), current_thread_system_id(), manual_reset_);
++    }
+     if (!manual_reset_) {
+       signal_ = false;
+     }
+@@ -487,6 +522,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+     }
+     count_ += release_count;
+     cond_.notify_all();
++    g_wait_notify_cv.notify_all();
+     return true;
+   }
+ 
+@@ -1070,6 +1106,24 @@ bool DispatchCurrentThreadUserCallback() {
+ 
+ namespace {
+ 
++bool TraceEventHandoffEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("TEKKEN6_TRACE_EVENT_HANDOFF");
++    return value && value[0] == '1';
++  }();
++  return enabled;
++}
++
++
++bool TakeEventHandoffTraceSlot() {
++  static std::atomic<uint32_t> count{0};
++  return count.fetch_add(1, std::memory_order_relaxed) < 256;
++}
++
++bool ShouldTraceEventHandoff() {
++  return TraceEventHandoffEnabled() && TakeEventHandoffTraceSlot();
++}
++
+ constexpr auto kAlertablePollSlice = std::chrono::milliseconds(1);
+ 
+ class ScopedAlertableState {
+@@ -1188,12 +1242,26 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
+   if (posix_wait_handle_to_signal == nullptr || posix_wait_handle_to_wait_on == nullptr) {
+     return WaitResult::kFailed;
+   }
++  if (ShouldTraceEventHandoff()) {
++    REXLOG_INFO("[Tekken6 event] signal_and_wait tid={} signal={} wait={} alertable={} timeout_ms={}",
++                current_thread_system_id(),
++                static_cast<const void*>(&posix_wait_handle_to_signal->condition()),
++                static_cast<const void*>(&posix_wait_handle_to_wait_on->condition()), is_alertable,
++                timeout == std::chrono::milliseconds::max() ? -1 : timeout.count());
++  }
+   if (!posix_wait_handle_to_signal->condition().Signal()) {
+     return WaitResult::kFailed;
+   }
+ 
+   if (!is_alertable) {
+-    return posix_wait_handle_to_wait_on->condition().Wait(timeout);
++    auto wait_result = posix_wait_handle_to_wait_on->condition().Wait(timeout);
++    if (ShouldTraceEventHandoff()) {
++      REXLOG_INFO("[Tekken6 event] signal_and_wait_return tid={} wait={} result={}",
++                  current_thread_system_id(),
++                  static_cast<const void*>(&posix_wait_handle_to_wait_on->condition()),
++                  static_cast<int>(wait_result));
++    }
++    return wait_result;
+   }
+ 
+   ScopedAlertableState alertable_state_guard(true);
+diff --git a/src/filesystem/devices/host_path_entry.cpp b/src/filesystem/devices/host_path_entry.cpp
+index 6650400..2775de0 100644
+--- a/src/filesystem/devices/host_path_entry.cpp
++++ b/src/filesystem/devices/host_path_entry.cpp
+@@ -51,13 +51,19 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
+ }
+ 
+ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
+-  if (is_read_only() &&
++  auto* host_device = static_cast<HostPathDevice*>(device_);
++  const bool virtual_root_sector = !parent_ && host_device->root_sector_probe_enabled();
++  if (is_read_only() && !virtual_root_sector &&
+       (desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData))) {
+     REXFS_ERROR("Attempting to open file for write access on read-only device");
+     return X_STATUS_ACCESS_DENIED;
+   }
++  if (virtual_root_sector) {
++    *out_file = new HostPathFile(desired_access, this, nullptr, true);
++    return X_STATUS_SUCCESS;
++  }
+   auto file_handle = rex::filesystem::FileHandle::OpenExisting(
+-      host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
++      host_path_, desired_access, host_device->allow_share_delete());
+   if (!file_handle) {
+     // TODO(benvanik): pick correct response.
+     return X_STATUS_NO_SUCH_FILE;
+diff --git a/src/filesystem/devices/host_path_file.cpp b/src/filesystem/devices/host_path_file.cpp
+index 4c57a18..5240bbc 100644
+--- a/src/filesystem/devices/host_path_file.cpp
++++ b/src/filesystem/devices/host_path_file.cpp
+@@ -12,11 +12,37 @@
+ #include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/filesystem/devices/host_path_file.h>
+ 
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
+ namespace rex::filesystem {
+ 
+ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
+-                           std::unique_ptr<rex::filesystem::FileHandle> file_handle)
+-    : File(file_access, entry), file_handle_(std::move(file_handle)) {}
++                           std::unique_ptr<rex::filesystem::FileHandle> file_handle,
++                           bool root_sector_probe)
++    : File(file_access, entry),
++      file_handle_(std::move(file_handle)),
++      root_sector_probe_(root_sector_probe) {
++  if (root_sector_probe_) {
++    root_sector_[0] = 'J';
++    root_sector_[1] = 'o';
++    root_sector_[2] = 's';
++    root_sector_[3] = 'h';
++    // FATX/Josh metadata is big-endian.  Tekken's Cache1 path expects
++    // 0x40 sectors per allocation unit and one root directory cluster.
++    root_sector_[8] = 0;
++    root_sector_[9] = 0;
++    root_sector_[10] = 0;
++    root_sector_[11] = 0x40;
++    root_sector_[12] = 0;
++    root_sector_[13] = 0;
++    root_sector_[14] = 0;
++    root_sector_[15] = 1;
++  }
++}
+ 
+ HostPathFile::~HostPathFile() = default;
+ 
+@@ -30,6 +56,38 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
+     return X_STATUS_ACCESS_DENIED;
+   }
+ 
++  if (root_sector_probe_) {
++    // Xbox 360 storage probes read the fourth 0x200-byte sector (offset
++    // 0x800).  The extracted game tree has no raw disk stream, but this
++    // minimal virtual stream supplies the documented Josh sector while
++    // leaving all normal child-file reads on HostPathFile unchanged.
++    if (byte_offset >= kJoshOffset + kJoshSize) {
++      if (out_bytes_read) *out_bytes_read = 0;
++      return X_STATUS_END_OF_FILE;
++    }
++    const size_t available = kJoshOffset + kJoshSize - byte_offset;
++    const size_t count = std::min(buffer.size(), available);
++    std::memset(buffer.data(), 0, count);
++    const size_t overlap_begin = std::max(byte_offset, kJoshOffset);
++    const size_t overlap_end = std::min(byte_offset + count, kJoshOffset + kJoshSize);
++    if (overlap_begin < overlap_end) {
++      const size_t overlap_size = overlap_end - overlap_begin;
++      std::memcpy(buffer.data() + (overlap_begin - byte_offset),
++                  root_sector_.data() + (overlap_begin - kJoshOffset), overlap_size);
++    }
++    if (std::getenv("TEKKEN6_TRACE_REX_FILE") != nullptr) {
++      static uint32_t trace_count = 0;
++      if (trace_count++ < 16) {
++        std::fprintf(stderr,
++                     "[tekken6-rex-josh] offset=0x%zx length=0x%zx bytes=0x%zx magic=%c%c%c%c\n",
++                     byte_offset, buffer.size(), count, root_sector_[0], root_sector_[1],
++                     root_sector_[2], root_sector_[3]);
++      }
++    }
++    if (out_bytes_read) *out_bytes_read = count;
++    return count == buffer.size() ? X_STATUS_SUCCESS : X_STATUS_END_OF_FILE;
++  }
++
+   if (file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read)) {
+     return X_STATUS_SUCCESS;
+   } else {
+@@ -44,7 +102,33 @@ X_STATUS HostPathFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_of
+     return X_STATUS_ACCESS_DENIED;
+   }
+ 
+-  if (file_handle_->Write(byte_offset, buffer.data(), buffer.size(), out_bytes_written)) {
++  if (root_sector_probe_) {
++    if (byte_offset >= kJoshOffset + kJoshSize) {
++      if (out_bytes_written) *out_bytes_written = 0;
++      return X_STATUS_END_OF_FILE;
++    }
++    const size_t available = kJoshOffset + kJoshSize - byte_offset;
++    const size_t count = std::min(buffer.size(), available);
++    const size_t overlap_begin = std::max(byte_offset, kJoshOffset);
++    const size_t overlap_end = std::min(byte_offset + count, kJoshOffset + kJoshSize);
++    if (overlap_begin < overlap_end) {
++      const size_t overlap_size = overlap_end - overlap_begin;
++      std::memcpy(root_sector_.data() + (overlap_begin - kJoshOffset),
++                  buffer.data() + (overlap_begin - byte_offset), overlap_size);
++    }
++    if (out_bytes_written) *out_bytes_written = count;
++    if (std::getenv("TEKKEN6_TRACE_REX_FILE") != nullptr) {
++      static uint32_t trace_count = 0;
++      if (trace_count++ < 16) {
++        std::fprintf(stderr,
++                     "[tekken6-rex-josh-write] offset=0x%zx length=0x%zx bytes=0x%zx\n",
++                     byte_offset, buffer.size(), count);
++      }
++    }
++    return count == buffer.size() ? X_STATUS_SUCCESS : X_STATUS_END_OF_FILE;
++  }
++
++  if (file_handle_ && file_handle_->Write(byte_offset, buffer.data(), buffer.size(), out_bytes_written)) {
+     return X_STATUS_SUCCESS;
+   } else {
+     return X_STATUS_END_OF_FILE;
+diff --git a/src/filesystem/devices/null_device.cpp b/src/filesystem/devices/null_device.cpp
+index aed2884..21f9a42 100644
+--- a/src/filesystem/devices/null_device.cpp
++++ b/src/filesystem/devices/null_device.cpp
+@@ -20,8 +20,12 @@
+ namespace rex::filesystem {
+ 
+ NullDevice::NullDevice(const std::string& mount_path,
+-                       const std::initializer_list<std::string>& null_paths)
+-    : Device(mount_path), null_paths_(null_paths), name_("NullDevice") {}
++                       const std::initializer_list<std::string>& null_paths,
++                       uint32_t sectors_per_allocation_unit)
++    : Device(mount_path),
++      null_paths_(null_paths),
++      name_("NullDevice"),
++      sectors_per_allocation_unit_(sectors_per_allocation_unit) {}
+ 
+ NullDevice::~NullDevice() = default;
+ 
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..f97b50a 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -299,6 +299,13 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+     return;
+   }
+ 
++  static std::atomic<uint32_t> tekken_interrupt_probe_count{0};
++  const uint32_t probe = tekken_interrupt_probe_count.fetch_add(1, std::memory_order_relaxed);
++  if (probe < 32) {
++    REXGPU_INFO("Interrupt probe #{} source={} cpu={} callback={:08X} data={:08X}", probe,
++                source, cpu, interrupt_callback_, interrupt_callback_data_);
++  }
++
+   auto thread = system::XThread::GetCurrentThread();
+   assert_not_null(thread);
+ 
+@@ -325,6 +332,12 @@ void GraphicsSystem::MarkVblank() {
+     command_processor_->increment_counter();
+   }
+ 
++  static std::atomic<uint32_t> tekken_vblank_probe_count{0};
++  const uint32_t probe = tekken_vblank_probe_count.fetch_add(1, std::memory_order_relaxed);
++  if (probe < 16) {
++    REXGPU_INFO("Vblank probe #{}", probe);
++  }
++
+   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
+   //     something wrong and the CP will block waiting for code that
+   //     needs to be run in the interrupt.
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..db04e9b 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -11,13 +11,18 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <chrono>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstring>
++#include <cstdlib>
+ #include <iterator>
+ #include <mutex>
+ #include <string>
+ #include <string_view>
+ #include <tuple>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -2156,6 +2161,28 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
+                                                   6);
+     }
++    // Keep this probe at the state write boundary rather than in the draw loop.  A
++    // fetch constant is six dwords, and the final dword is normally delivered by
++    // the sixth sequential register write.  Logging only that boundary keeps the
++    // startup trace bounded while showing the exact PM4-produced descriptor.
++    const uint32_t fetch_dword = index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
++    if (std::getenv("TEKKEN6_TRACE_FETCH_WRITES") != nullptr && fetch_dword % 6 == 5) {
++      static std::atomic<uint32_t> fetch_write_probe_count{0};
++      const uint32_t slot = fetch_dword / 6;
++      const uint32_t* words = register_file_->values +
++                              XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6;
++      // The interesting descriptors in this title use the 0x0CD6 fallback
++      // region or the 0x10BC logo region. Ignore the thousands of unrelated
++      // vertex-style writes so this remains cheap through the full startup.
++      const uint32_t base_hint = words[1] & 0xFFFFF000;
++      if (base_hint == 0x0CD60000 || base_hint == 0x10BC4000 || words[0] == 0x82000002) {
++        const uint32_t probe = fetch_write_probe_count.fetch_add(1);
++        if (probe < 256) {
++        REXGPU_INFO("T6 fetch write #{} slot={} words={:08X}/{:08X}/{:08X}/{:08X}/{:08X}/{:08X}",
++                    probe, slot, words[0], words[1], words[2], words[3], words[4], words[5]);
++        }
++      }
++    }
+     InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
+   }
+ }
+@@ -2239,6 +2266,24 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
+     if (texture_cache_) {
+       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+     }
++    if (std::getenv("TEKKEN6_TRACE_FETCH_WRITES") != nullptr) {
++      static std::atomic<uint32_t> fetch_write_probe_count_mem{0};
++      const uint32_t first_slot = first_fetch_dword / 6;
++      const uint32_t last_slot = last_fetch_dword / 6;
++      for (uint32_t slot = first_slot; slot <= last_slot && slot < 32; ++slot) {
++        const uint32_t* words = register_file_->values +
++                                XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6;
++        const uint32_t base_hint = words[1] & 0xFFFFF000;
++        if (base_hint == 0x0CD60000 || base_hint == 0x10BC4000 || words[0] == 0x82000002) {
++          const uint32_t probe = fetch_write_probe_count_mem.fetch_add(1);
++          if (probe < 256) {
++            REXGPU_INFO("T6 fetch mem write #{} slot={} range={}-{} words={:08X}/{:08X}/{:08X}/{:08X}/{:08X}/{:08X}",
++                        probe, slot, first_fetch_dword, last_fetch_dword, words[0], words[1], words[2],
++                        words[3], words[4], words[5]);
++          }
++        }
++      }
++    }
+     InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+     return;
+   }
+@@ -2291,8 +2336,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+ 
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+-                                            frame_used_async_placeholder_pipeline_;
++                                            frame_used_async_placeholder_pipeline_ &&
++                                            std::getenv("TEKKEN6_FORCE_PRESENT") == nullptr;
+   if (skip_present_due_async_placeholder) {
++    static std::atomic<uint64_t> async_placeholder_skip_count{0};
++    const uint64_t skipped_count =
++        async_placeholder_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+     static bool skipped_incomplete_frame_logged = false;
+     if (!skipped_incomplete_frame_logged) {
+       skipped_incomplete_frame_logged = true;
+@@ -2300,6 +2349,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+           "Skipping Vulkan frame presentation due to async placeholder draw "
+           "usage in this frame");
+     }
++    if (std::getenv("TEKKEN6_TRACE_SWAP") != nullptr) {
++      static std::atomic<int64_t> last_skip_log_ms{0};
++      const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                 std::chrono::steady_clock::now().time_since_epoch())
++                                 .count();
++      int64_t previous_log_ms = last_skip_log_ms.load(std::memory_order_relaxed);
++      if (skipped_count <= 8 || now_ms - previous_log_ms >= 1000) {
++        if (skipped_count <= 8 || last_skip_log_ms.compare_exchange_strong(
++                                      previous_log_ms, now_ms, std::memory_order_relaxed)) {
++          REXGPU_INFO("T6 swap skipped seq={} reason=async_placeholder", skipped_count);
++        }
++      }
++    }
+     EndSubmission(true);
+     return;
+   }
+@@ -2312,6 +2374,22 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
+   xenos::TextureFormat frontbuffer_format;
+   bool swap_source_needs_rb_swap = false;
++  if (std::getenv("TEKKEN6_TRACE_SWAP") != nullptr) {
++    static std::atomic<uint64_t> swap_request_count{0};
++    static std::atomic<int64_t> last_swap_log_ms{0};
++    const uint64_t sequence = swap_request_count.fetch_add(1, std::memory_order_relaxed) + 1;
++    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                               std::chrono::steady_clock::now().time_since_epoch())
++                               .count();
++    int64_t previous_log_ms = last_swap_log_ms.load(std::memory_order_relaxed);
++    if (sequence <= 8 || now_ms - previous_log_ms >= 1000) {
++      if (sequence <= 8 || last_swap_log_ms.compare_exchange_strong(
++                               previous_log_ms, now_ms, std::memory_order_relaxed)) {
++        REXGPU_INFO("T6 swap request seq={} frontbuffer_ptr={:08X} size={}x{}", sequence,
++                    frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++      }
++    }
++  }
+   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
+       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
+@@ -3596,6 +3674,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   const RegisterFile& regs = *register_file_;
+   (void)index_buffer_info;
++  static std::atomic<uint32_t> tekken_draw_probe_count{0};
++  const uint32_t tekken_draw_probe = tekken_draw_probe_count.fetch_add(1);
++  if (tekken_draw_probe < 64) {
++    REXGPU_INFO(
++        "Draw probe #{} prim={} indices={} edram={} surface_pitch={} vs={} ps={} mode={}",
++        tekken_draw_probe, uint32_t(prim_type), index_count,
++        uint32_t(regs.Get<reg::RB_MODECONTROL>().edram_mode),
++        uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
++        active_vertex_shader() != nullptr, active_pixel_shader() != nullptr,
++        major_mode_explicit);
++  }
+   auto draw_fail = [&](const char* stage) {
+     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+     REXGPU_ERROR(
+@@ -3611,6 +3700,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   };
+ 
+   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
++  reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
++  const auto color0 = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
++  static std::atomic<uint32_t> tekken_color_probe_count{0};
++  const bool tekken_color_candidate =
++      edram_mode == xenos::EdramMode::kColorDepth && regs[XE_GPU_REG_RB_COLOR_MASK] != 0;
++  const uint32_t tekken_color_probe =
++      tekken_color_candidate ? tekken_color_probe_count.fetch_add(1) : UINT32_MAX;
+   if (edram_mode == xenos::EdramMode::kCopy) {
+     // Special copy handling.
+     return IssueCopy();
+@@ -3629,6 +3725,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     return draw_fail("missing_vertex_shader");
+   }
+   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
++  if (std::getenv("TEKKEN6_TRACE_SHADER") != nullptr && tekken_draw_probe < 64) {
++    REXGPU_INFO(
++        "Shader state #{} VS hash={:016X} dwords={} writes_color={:X} memexport={}",
++        tekken_draw_probe, vertex_shader->ucode_data_hash(), vertex_shader->ucode_dword_count(),
++        vertex_shader->writes_color_targets(), vertex_shader->memexport_eM_written());
++  }
+   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
+   if (memexport_used_vertex) {
+     if (!device_properties.vertexPipelineStoresAndAtomics) {
+@@ -3656,6 +3758,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       pixel_shader = static_cast<VulkanShader*>(active_pixel_shader());
+       if (pixel_shader) {
+         pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
++        if (std::getenv("TEKKEN6_TRACE_SHADER") != nullptr && tekken_draw_probe < 64) {
++          REXGPU_INFO(
++              "Shader state #{} PS hash={:016X} dwords={} writes_color={:X} memexport={}",
++              tekken_draw_probe, pixel_shader->ucode_data_hash(), pixel_shader->ucode_dword_count(),
++              pixel_shader->writes_color_targets(), pixel_shader->memexport_eM_written());
++        }
+         if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
+           pixel_shader = nullptr;
+         }
+@@ -3669,6 +3777,57 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       return true;
+     }
+   }
++  if (tekken_draw_probe < 64) {
++    const uint32_t ps_writes = pixel_shader ? pixel_shader->writes_color_targets() : 0;
++    draw_util::Scissor scissor;
++    draw_util::GetScissor(regs, scissor);
++    REXGPU_INFO(
++        "Draw state #{} raster={} polygonal={} pixel_shader={} ps_writes={:X} color_mask={:X} "
++        "color0_base={:X} color0_fmt={} scissor={}x{}+{},{} depth_z={} depth_w={}",
++        tekken_draw_probe, is_rasterization_done, primitive_polygonal, pixel_shader != nullptr,
++        ps_writes, regs[XE_GPU_REG_RB_COLOR_MASK],
++        uint32_t(color0.color_base) | (uint32_t(color0.color_base_bit_11) << 11),
++        uint32_t(color0.color_format),
++        scissor.extent[0], scissor.extent[1], scissor.offset[0], scissor.offset[1],
++        uint32_t(normalized_depth_control.z_enable), uint32_t(normalized_depth_control.z_write_enable));
++  }
++  if (tekken_color_probe < 64) {
++    REXGPU_INFO("Color candidate #{} draw={} pixel_shader={} ps_writes={:X} surface_pitch={} "
++                "edram_base={} color_mask={:X}",
++                tekken_color_probe, tekken_draw_probe, pixel_shader != nullptr,
++                pixel_shader ? pixel_shader->writes_color_targets() : 0,
++                uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
++                uint32_t(color0.color_base) | (uint32_t(color0.color_base_bit_11) << 11),
++                regs[XE_GPU_REG_RB_COLOR_MASK]);
++  }
++  // Bounded startup decoder window.  The retail movie path reads compressed
++  // WMV data into scratch memory and then emits GPU work before the first
++  // fullscreen YUV conversion draw.  This probe records that producer range
++  // without logging the entire frame stream.
++  if (std::getenv("TEKKEN6_TRACE_DECODER_DRAWS") != nullptr &&
++      tekken_draw_probe >= 50 && tekken_draw_probe < 1367 &&
++      (pixel_shader != nullptr || memexport_used_vertex ||
++       regs[XE_GPU_REG_RB_COLOR_MASK] != 0)) {
++    static std::atomic<uint32_t> decoder_draw_probe_count{0};
++    const uint32_t n = decoder_draw_probe_count.fetch_add(1);
++    if (n < 512) {
++      draw_util::Scissor decoder_scissor;
++      draw_util::GetScissor(regs, decoder_scissor);
++      REXGPU_INFO(
++          "T6 decoder draw #{} draw={} edram={} raster={} ps={} ps_writes={:X} "
++          "vs_memexport={} ps_memexport={} color_base={:X} fmt={} mask={:X} "
++          "scissor={}x{}+{},{} indices={} vs={:016X} ps={:016X}",
++          n, tekken_draw_probe, uint32_t(edram_mode), uint32_t(is_rasterization_done),
++          pixel_shader != nullptr, pixel_shader ? pixel_shader->writes_color_targets() : 0,
++          uint32_t(memexport_used_vertex), uint32_t(pixel_shader && pixel_shader->memexport_eM_written()),
++          uint32_t(color0.color_base) | (uint32_t(color0.color_base_bit_11) << 11),
++          uint32_t(color0.color_format), regs[XE_GPU_REG_RB_COLOR_MASK],
++          decoder_scissor.extent[0], decoder_scissor.extent[1], decoder_scissor.offset[0],
++          decoder_scissor.offset[1], index_count,
++          vertex_shader ? vertex_shader->ucode_data_hash() : 0,
++          pixel_shader ? pixel_shader->ucode_data_hash() : 0);
++    }
++  }
+   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+   if (memexport_used_pixel) {
+     if (!device_properties.fragmentStoresAndAtomics) {
+@@ -3679,8 +3838,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
+   }
+-  reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+-
+   uint32_t ps_param_gen_pos = UINT32_MAX;
+   uint32_t interpolator_mask =
+       pixel_shader ? (vertex_shader->writes_interpolators() &
+@@ -3711,6 +3868,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     if (!primitive_processor_->Process(primitive_processing_result)) {
+       return draw_fail("primitive_processing");
+     }
++    if (tekken_draw_probe < 64) {
++      REXGPU_INFO(
++          "Draw detail #{} guest_vertices={} host_vertices={} guest_prim={} host_prim={} "
++          "index_base={:08X} index_type={} shader_index_endian={}",
++          tekken_draw_probe, primitive_processing_result.guest_draw_vertex_count,
++          primitive_processing_result.host_draw_vertex_count,
++          uint32_t(primitive_processing_result.guest_primitive_type),
++          uint32_t(primitive_processing_result.host_primitive_type),
++          primitive_processing_result.guest_index_base,
++          uint32_t(primitive_processing_result.host_index_format),
++          uint32_t(primitive_processing_result.host_shader_index_endian));
++    }
+     if (!primitive_processing_result.host_draw_vertex_count) {
+       // Nothing to draw.
+       return true;
+@@ -3745,7 +3914,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                                    *pixel_shader, interpolator_mask,
+                                                    ps_param_gen_pos, normalized_depth_control)
+                                              : SpirvShaderTranslator::Modification(0);
+-
+     // Translate the shaders now to obtain the sampler bindings.
+     vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+         vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+@@ -3829,12 +3997,164 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                    : 0;
+ 
++  if (std::getenv("TEKKEN6_TRACE_DRAW_WINDOW") != nullptr && tekken_draw_probe >= 4398 &&
++      tekken_draw_probe < 4440) {
++    draw_util::Scissor trace_scissor;
++    draw_util::GetScissor(regs, trace_scissor);
++    REXGPU_INFO(
++        "T6 draw window draw={} prim={} indices={} raster_done={} ps={:016X} ps_writes={} "
++        "mask={:X} surface_pitch={} color_base={:X} fmt={} scissor={}x{}+{},{} vs={:016X}",
++        tekken_draw_probe, uint32_t(prim_type), index_count, uint32_t(is_rasterization_done),
++        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
++        pixel_shader ? uint32_t(pixel_shader->writes_color_targets()) : 0,
++        normalized_color_mask, uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
++        regs.Get<reg::RB_COLOR_INFO>().color_base,
++        uint32_t(regs.Get<reg::RB_COLOR_INFO>().color_format),
++        trace_scissor.extent[0], trace_scissor.extent[1], trace_scissor.offset[0],
++        trace_scissor.offset[1], vertex_shader ? vertex_shader->ucode_data_hash() : 0);
++  }
++  if (std::getenv("TEKKEN6_TRACE_FULLSCREEN_DRAW") != nullptr) {
++    draw_util::Scissor fullscreen_scissor;
++    draw_util::GetScissor(regs, fullscreen_scissor);
++    if (pixel_shader && fullscreen_scissor.extent[0] == 1280 &&
++        fullscreen_scissor.extent[1] == 720 && fullscreen_scissor.offset[0] == 0 &&
++        fullscreen_scissor.offset[1] == 0) {
++      static std::atomic<uint32_t> fullscreen_probe_count{0};
++      const uint32_t fullscreen_probe = fullscreen_probe_count.fetch_add(1);
++      if (fullscreen_probe < 128) {
++        REXGPU_INFO("T6 fullscreen draw #{} draw={} prim={} indices={} VS={:016X} PS={:016X} "
++                    "color_mask={:X} blend={:08X} clear={:08X}",
++                    fullscreen_probe, tekken_draw_probe, uint32_t(prim_type), index_count,
++                    vertex_shader->ucode_data_hash(), pixel_shader->ucode_data_hash(),
++                    regs[XE_GPU_REG_RB_COLOR_MASK],
++                    regs[reg::RB_BLENDCONTROL::rt_register_indices[0]],
++                    regs[XE_GPU_REG_RB_COLOR_CLEAR]);
++      }
++    }
++  }
++
+   // Update the textures before most other work in the submission because
+   // samplers depend on this (and in case of sampler overflow in a submission,
+   // submissions must be split) - may perform dispatches and copying.
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++  if (std::getenv("TEKKEN6_TRACE_TEXTURE_MASK") != nullptr &&
++      tekken_draw_probe >= 1300 && tekken_draw_probe < 1400) {
++    REXGPU_INFO(
++        "T6 texture mask draw={} mask={:08X} vs={:016X} ps={:016X} "
++        "vs_used={:08X} ps_used={:08X}",
++        tekken_draw_probe, used_texture_mask, vertex_shader->ucode_data_hash(),
++        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
++        vertex_shader->GetUsedTextureMaskAfterTranslation(),
++        pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++  }
++  bool tekken_logo_texture_draw = false;
++  bool tekken_overlay_texture_draw = false;
++  const bool trace_texture_draw = std::getenv("TEKKEN6_TRACE_TEXTURE_DRAW") != nullptr;
++  const bool trace_logo_only = std::getenv("TEKKEN6_TRACE_LOGO_ONLY") != nullptr;
++  const bool trace_texture_summary = std::getenv("TEKKEN6_TRACE_TEXTURE_SUMMARY") != nullptr;
++  const bool trace_texture_stats = std::getenv("TEKKEN6_TRACE_TEXTURE_STATS") != nullptr;
++  static std::atomic<uint32_t> texture_summary_count{0};
++  static std::atomic<uint32_t> texture_stats_count{0};
++  if ((trace_texture_draw || trace_logo_only || trace_texture_summary) && used_texture_mask != 0) {
++    uint32_t trace_index = 0;
++    while (rex::bit_scan_forward(used_texture_mask, &trace_index)) {
++      used_texture_mask &= ~(uint32_t(1) << trace_index);
++      const auto fetch = regs.GetTextureFetch(trace_index);
++      uint32_t width_minus_1 = 0, height_minus_1 = 0, depth_minus_1 = 0;
++      uint32_t base_page = 0, mip_page = 0;
++      texture_util::GetSubresourcesFromFetchConstant(
++          fetch, &width_minus_1, &height_minus_1, &depth_minus_1, &base_page, &mip_page,
++          nullptr, nullptr);
++      if (base_page == 0x10BC4) {
++        tekken_logo_texture_draw = true;
++      }
++      if (base_page == 0x0CD63) {
++        tekken_overlay_texture_draw = true;
++      }
++      if (trace_texture_draw || base_page == 0x10BC4 ||
++          (trace_texture_summary && texture_summary_count.fetch_add(1) < 512)) {
++        REXGPU_INFO(
++            "T6 texture draw={} slot={} base={:08X} mip={:08X} size={}x{} format={} "
++            "dim={} tiled={} pitch={} ps_hash={:016X}",
++            tekken_draw_probe, trace_index, base_page << 12, mip_page << 12,
++            width_minus_1 + 1, height_minus_1 + 1, uint32_t(fetch.format),
++            uint32_t(fetch.dimension), uint32_t(fetch.tiled), uint32_t(fetch.pitch),
++            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
++      }
++
++      // Sample guest memory at the point the texture is actually requested.
++      // This is intentionally small and bounded: it distinguishes an empty
++      // movie/resource surface from a later sampler or resolve failure without
++      // dumping megabytes on every draw.
++      if (trace_texture_stats && texture_stats_count.fetch_add(1) < 64) {
++        const uint8_t* texture_bytes =
++            memory_->TranslatePhysical(uint64_t(base_page) << 12);
++        uint32_t nonzero = 0;
++        uint32_t sample_bytes = 0;
++        if (texture_bytes) {
++          sample_bytes = std::min<uint32_t>(4096u,
++                                            (width_minus_1 + 1u) *
++                                                (height_minus_1 + 1u) * 4u);
++          for (uint32_t i = 0; i < sample_bytes; ++i) {
++            nonzero += texture_bytes[i] != 0;
++          }
++        }
++        REXGPU_INFO("T6 texture stats draw={} base={:08X} sample={} nonzero={} head={:02X}{:02X}{:02X}{:02X}",
++                    tekken_draw_probe, base_page << 12, sample_bytes, nonzero,
++                    texture_bytes ? texture_bytes[0] : 0,
++                    texture_bytes ? texture_bytes[1] : 0,
++                    texture_bytes ? texture_bytes[2] : 0,
++                    texture_bytes ? texture_bytes[3] : 0);
++      }
++
++      // Keep this diagnostic bounded and opt-in.  It records the bytes the
++      // texture cache is about to consume, which separates a bad DATA decode
++      // from a later sampler/RT problem without changing guest or GPU state.
++      if (std::getenv("TEKKEN6_DUMP_TEXTURE_BYTES") != nullptr) {
++        static std::unordered_set<uint32_t> dumped_texture_bases;
++        if (dumped_texture_bases.size() < 16 &&
++            dumped_texture_bases.insert(base_page).second) {
++          const uint64_t byte_count64 =
++              std::min<uint64_t>((uint64_t(width_minus_1) + 1) *
++                                     (uint64_t(height_minus_1) + 1) * 4u,
++                                 0x400000u);
++          const uint8_t* texture_bytes =
++              memory_->TranslatePhysical(uint64_t(base_page) << 12);
++          if (texture_bytes && byte_count64) {
++            char path[96];
++            std::snprintf(path, sizeof(path), "/tmp/tekken6_tex_%08X.bin",
++                          base_page << 12);
++            if (FILE* dump = std::fopen(path, "wb")) {
++              std::fwrite(texture_bytes, 1, size_t(byte_count64), dump);
++              std::fclose(dump);
++              REXGPU_INFO("T6 texture dump base={:08X} bytes={} path={}",
++                          base_page << 12, byte_count64, path);
++            }
++          }
++        }
++      }
++    }
++  }
++  // The trace above consumes a local copy of the mask; recompute it for the
++  // actual texture request below.
++  used_texture_mask = vertex_shader->GetUsedTextureMaskAfterTranslation() |
++                      (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++
++  // Diagnostic only: keep all resource, pipeline, and render-target work for
++  // the startup fade, but optionally omit its final Vulkan draw command.
++  // Returning before RequestTextures would also suppress unrelated state and
++  // make this probe look like a guest or loader failure.
++  const bool skip_overlay_draw =
++      tekken_overlay_texture_draw && std::getenv("TEKKEN6_SKIP_OVERLAY_DRAW") != nullptr;
++  if (skip_overlay_draw) {
++    static std::atomic<uint32_t> skipped_overlay_draw_count{0};
++    const uint32_t skipped = skipped_overlay_draw_count.fetch_add(1);
++    if (skipped < 8) {
++      REXGPU_INFO("T6 diagnostic will skip overlay draw={} count={}", tekken_draw_probe, skipped);
++    }
++  }
+   texture_cache_->RequestTextures(used_texture_mask);
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+@@ -3862,6 +4182,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
+                                                 &pipeline_is_placeholder);
+   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
++    static std::atomic<uint32_t> tekken_placeholder_probe_count{0};
++    const uint32_t placeholder_probe = tekken_placeholder_probe_count.fetch_add(1);
++    if (std::getenv("TEKKEN6_TRACE_PLACEHOLDER") != nullptr && placeholder_probe < 128) {
++      REXGPU_INFO(
++          "T6 async placeholder #{} draw={} ps={} ps_writes={:X} color_mask={:X} "
++          "surface_pitch={} color_base={:X}",
++          placeholder_probe, tekken_draw_probe, pixel_shader != nullptr,
++          pixel_shader ? pixel_shader->writes_color_targets() : 0,
++          regs[XE_GPU_REG_RB_COLOR_MASK],
++          uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
++          uint32_t(color0.color_base) | (uint32_t(color0.color_base_bit_11) << 11));
++    }
+     frame_used_async_placeholder_pipeline_ = true;
+     return true;
+   }
+@@ -3937,6 +4269,108 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+ 
++  if (tekken_logo_texture_draw && std::getenv("TEKKEN6_TRACE_LOGO_DRAW") != nullptr) {
++    static std::atomic<uint32_t> tekken_logo_draw_probe_count{0};
++    const uint32_t logo_probe = tekken_logo_draw_probe_count.fetch_add(1);
++    if (logo_probe < 128) {
++      draw_util::Scissor logo_scissor;
++      draw_util::GetScissor(regs, logo_scissor);
++      // ReXGlue's disassembler names hardware fetch slot 95 "vf0"
++      // (translator_disasm.cpp:331). Probe the slot the shader actually uses.
++      const auto logo_vfetch = regs.GetVertexFetch(95);
++      const auto logo_vfetch1 = regs.GetVertexFetch(94);
++      const auto logo_vfetch2 = regs.GetVertexFetch(93);
++      REXGPU_INFO(
++          "T6 logo draw #{} draw={} prim={} indices={} guest_vertices={} host_vertices={} "
++          "host_prim={} viewport={}x{}+{},{} scissor={}x{}+{},{} surface_pitch={} "
++          "color_mask={:X} norm_color_mask={:X} blend={:08X} clear={:08X} depth={}/{} ps={:016X}",
++          logo_probe, tekken_draw_probe, uint32_t(prim_type), index_count,
++          primitive_processing_result.guest_draw_vertex_count,
++          primitive_processing_result.host_draw_vertex_count,
++          uint32_t(primitive_processing_result.host_primitive_type), viewport_info.xy_extent[0],
++          viewport_info.xy_extent[1], viewport_info.xy_offset[0], viewport_info.xy_offset[1],
++          logo_scissor.extent[0], logo_scissor.extent[1], logo_scissor.offset[0],
++          logo_scissor.offset[1], uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
++          regs[XE_GPU_REG_RB_COLOR_MASK], normalized_color_mask,
++          regs[reg::RB_BLENDCONTROL::rt_register_indices[0]],
++          regs[XE_GPU_REG_RB_COLOR_CLEAR],
++          uint32_t(normalized_depth_control.z_enable),
++          uint32_t(normalized_depth_control.z_write_enable),
++          pixel_shader ? pixel_shader->ucode_data_hash() : 0);
++      REXGPU_INFO(
++          "T6 logo VS={} hw_vf95(vf0)={:08X}/{:08X} hw_vf94(vf1)={:08X}/{:08X} "
++          "hw_vf93(vf2)={:08X}/{:08X}",
++          vertex_shader ? vertex_shader->ucode_data_hash() : 0,
++          logo_vfetch.dword_0, logo_vfetch.dword_1,
++          logo_vfetch1.dword_0, logo_vfetch1.dword_1,
++          logo_vfetch2.dword_0, logo_vfetch2.dword_1);
++      const auto& logo_vmap = vertex_shader->constant_register_map().vertex_fetch_bitmap;
++      REXGPU_INFO("T6 logo VS fetch bitmap={:08X}/{:08X}/{:08X}", logo_vmap[0], logo_vmap[1],
++                  logo_vmap[2]);
++      if (logo_probe == 0) {
++        const auto logo_tfetch = regs.GetTextureFetch(0);
++        auto log_float_constant = [&](uint32_t index) {
++          const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_000_X + (index << 2);
++          REXGPU_INFO(
++              "T6 logo VS c{}={:08X},{:08X},{:08X},{:08X} f={},{},{},{}", index,
++              regs[base + 0], regs[base + 1], regs[base + 2], regs[base + 3],
++              regs.Get<float>(base + 0), regs.Get<float>(base + 1), regs.Get<float>(base + 2),
++              regs.Get<float>(base + 3));
++        };
++        log_float_constant(128);
++        log_float_constant(129);
++        log_float_constant(130);
++        log_float_constant(131);
++        log_float_constant(132);
++        log_float_constant(133);
++        REXGPU_INFO(
++            "T6 logo TF0={:08X}/{:08X}/{:08X}/{:08X}/{:08X}/{:08X} addr={:08X} mip={:08X} "
++            "format={} endian={} tiled={} pitch={} swizzle={:03X}",
++            logo_tfetch.dword_0, logo_tfetch.dword_1, logo_tfetch.dword_2,
++            logo_tfetch.dword_3, logo_tfetch.dword_4, logo_tfetch.dword_5,
++            logo_tfetch.base_address << 12, logo_tfetch.mip_address << 12,
++            uint32_t(logo_tfetch.format), uint32_t(logo_tfetch.endianness),
++            uint32_t(logo_tfetch.tiled), uint32_t(logo_tfetch.pitch),
++            uint32_t(logo_tfetch.swizzle));
++      }
++      if (std::getenv("TEKKEN6_DUMP_LOGO_VB") != nullptr && logo_probe == 0) {
++        const uint32_t byte_count = std::min(logo_vfetch.size * 4u, uint32_t(0x4000));
++        const uint8_t* vertex_bytes = memory_->TranslatePhysical(logo_vfetch.address * 4u);
++        if (FILE* dump = std::fopen("/tmp/tekken6_logo_vb.bin", "wb")) {
++          std::fwrite(vertex_bytes, 1, byte_count, dump);
++          std::fclose(dump);
++        }
++        REXGPU_INFO(
++            "T6 logo vertex fetch dword0={:08X} dword1={:08X} address={:08X} words={} "
++            "endian={} bytes={} head={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
++            logo_vfetch.dword_0, logo_vfetch.dword_1, logo_vfetch.address, logo_vfetch.size,
++            uint32_t(logo_vfetch.endian), byte_count, vertex_bytes[0], vertex_bytes[1],
++            vertex_bytes[2], vertex_bytes[3], vertex_bytes[4], vertex_bytes[5], vertex_bytes[6],
++            vertex_bytes[7]);
++      }
++      if (std::getenv("TEKKEN6_TRACE_LOGO_VERTICES") != nullptr && logo_probe < 32) {
++        // Guest vertex attributes are big-endian float32 values. Log one
++        // position and UV from each rotating buffer to distinguish an
++        // off-screen animation from a fetch or translation error.
++        const uint8_t* vertex_bytes = memory_->TranslatePhysical(logo_vfetch.address * 4u);
++        auto load_guest_float = [&](uint32_t offset) {
++          uint32_t bits = 0;
++          std::memcpy(&bits, vertex_bytes + offset, sizeof(bits));
++          bits = __builtin_bswap32(bits);
++          float value = 0.0f;
++          std::memcpy(&value, &bits, sizeof(value));
++          return value;
++        };
++        if (vertex_bytes) {
++          REXGPU_INFO(
++              "T6 logo vertex probe #{} draw={} addr={:08X} pos=({},{},{}) uv=({},{})",
++              logo_probe, tekken_draw_probe, logo_vfetch.address * 4u,
++              load_guest_float(0), load_guest_float(4), load_guest_float(8),
++              load_guest_float(32), load_guest_float(36));
++        }
++      }
++    }
++  }
+   // Whether to load the guest 32-bit (usually big-endian) vertex index
+   // indirectly in the vertex shader if full 32-bit indices are not supported by
+   // the host.
+@@ -4116,11 +4550,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       render_target_cache_->last_update_framebuffer());
+ 
+   // Draw.
+-  if (primitive_processing_result.index_buffer_type ==
+-          PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+-      shader_32bit_index_dma) {
++  if (!skip_overlay_draw &&
++      (primitive_processing_result.index_buffer_type ==
++           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
++       shader_32bit_index_dma)) {
+     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+-  } else {
++  } else if (!skip_overlay_draw) {
+     std::pair<VkBuffer, VkDeviceSize> index_buffer;
+     switch (primitive_processing_result.index_buffer_type) {
+       case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA:
+@@ -4150,10 +4585,64 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
+             ? VK_INDEX_TYPE_UINT16
+             : VK_INDEX_TYPE_UINT32);
+-    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+-                                              0, 0, 0);
++    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count,
++                                              1, 0, 0, 0);
++  }
++
++  // The texture probe above runs before the command is recorded. Keep a
++  // bounded post-recording probe so we can distinguish frontend state from an
++  // actual Vulkan draw command, and record which render target it was aimed at.
++  if (tekken_logo_texture_draw && std::getenv("TEKKEN6_TRACE_LOGO_DRAW") != nullptr) {
++    static std::atomic<uint32_t> tekken_logo_submit_probe_count{0};
++    const uint32_t logo_submit_probe = tekken_logo_submit_probe_count.fetch_add(1);
++    if (logo_submit_probe < 128) {
++      REXGPU_INFO(
++          "T6 logo draw submitted #{} draw={} indexed={} host_vertices={} color_base={:X} "
++          "color_fmt={} surface_pitch={} scissor_mask={:X}",
++          logo_submit_probe, tekken_draw_probe,
++          primitive_processing_result.index_buffer_type !=
++              PrimitiveProcessor::ProcessedIndexBufferType::kNone && !shader_32bit_index_dma,
++          primitive_processing_result.host_draw_vertex_count,
++          uint32_t(color0.color_base) | (uint32_t(color0.color_base_bit_11) << 11),
++          uint32_t(color0.color_format), uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
++          regs[XE_GPU_REG_RB_COLOR_MASK]);
++    }
++  }
++  if (tekken_overlay_texture_draw && std::getenv("TEKKEN6_TRACE_OVERLAY_DRAW") != nullptr) {
++    draw_util::Scissor overlay_scissor;
++    draw_util::GetScissor(regs, overlay_scissor);
++    const auto overlay_vfetch = regs.GetVertexFetch(95);
++    REXGPU_INFO(
++        "T6 overlay draw={} prim={} indices={} guest_vertices={} host_vertices={} host_prim={} "
++        "viewport={}x{}+{},{} scissor={}x{}+{},{} surface_pitch={} color_mask={:X} "
++        "norm_mask={:X} color_base={:X} fmt={} VS={:016X} PS={:016X} vf95={:08X}/{:08X} "
++        "addr={:08X} size={} endian={}",
++        tekken_draw_probe, uint32_t(prim_type), index_count,
++        primitive_processing_result.guest_draw_vertex_count,
++        primitive_processing_result.host_draw_vertex_count,
++        uint32_t(primitive_processing_result.host_primitive_type), viewport_info.xy_extent[0],
++        viewport_info.xy_extent[1], viewport_info.xy_offset[0], viewport_info.xy_offset[1],
++        overlay_scissor.extent[0], overlay_scissor.extent[1], overlay_scissor.offset[0],
++        overlay_scissor.offset[1], uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
++        regs[XE_GPU_REG_RB_COLOR_MASK], normalized_color_mask,
++        uint32_t(color0.color_base) | (uint32_t(color0.color_base_bit_11) << 11),
++        uint32_t(color0.color_format), vertex_shader ? vertex_shader->ucode_data_hash() : 0,
++        pixel_shader ? pixel_shader->ucode_data_hash() : 0, overlay_vfetch.dword_0,
++        overlay_vfetch.dword_1, overlay_vfetch.address << 2, overlay_vfetch.size,
++        uint32_t(overlay_vfetch.endian));
++    auto log_overlay_constant = [&](uint32_t index) {
++      const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_000_X + (index << 2);
++      REXGPU_INFO("T6 overlay VS c{}={:08X},{:08X},{:08X},{:08X} f={},{},{},{}", index,
++                  regs[base + 0], regs[base + 1], regs[base + 2], regs[base + 3],
++                  regs.Get<float>(base + 0), regs.Get<float>(base + 1),
++                  regs.Get<float>(base + 2), regs.Get<float>(base + 3));
++    };
++    log_overlay_constant(128);
++    log_overlay_constant(129);
++    log_overlay_constant(131);
++    log_overlay_constant(132);
++    log_overlay_constant(133);
+   }
+-
+   // Invalidate textures in memexported memory and watch for changes.
+   if (!memexport_ranges_.empty()) {
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..58514ab 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1140,6 +1140,18 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+     return false;
+   }
+ 
++  if (std::getenv("TEKKEN6_TRACE_RESOLVE") != nullptr) {
++    REXGPU_INFO(
++        "T6 resolve src={} depth={} color_base={:X} dest_base={:08X} dest_start={:08X} dest_len={:08X} "
++        "rect={}x{} pitch_tiles={} fmt={} copy_control={:08X}",
++        uint32_t(resolve_info.rb_copy_control.copy_src_select), resolve_info.IsCopyingDepth(),
++        resolve_info.color_original_base, resolve_info.copy_dest_base,
++        resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
++        resolve_info.coordinate_info.width_div_8 * 8, resolve_info.height_div_8 * 8,
++        uint32_t(resolve_info.color_edram_info.pitch_tiles), uint32_t(resolve_info.copy_dest_info.copy_dest_format),
++        resolve_info.rb_copy_control.value);
++  }
++
+   // Nothing to copy/clear.
+   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
+     return true;
+@@ -6025,6 +6037,19 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
+ 
+   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                  dump_rectangles_);
++  if (std::getenv("TEKKEN6_TRACE_RESOLVE_DUMP") != nullptr) {
++    REXGPU_INFO(
++        "T6 resolve dump base={:X} row_length={} rows={} pitch={} rectangles={}",
++        dump_base, dump_row_length_used, dump_rows, dump_pitch, dump_rectangles_.size());
++    for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
++      const RenderTargetKey key = rectangle.render_target->key();
++      REXGPU_INFO(
++          "T6 resolve owner base={:X} pitch={} msaa={} depth={} format={} row_first={} rows={} start={} end={}",
++          key.base_tiles, key.GetPitchTiles(), uint32_t(key.msaa_samples), key.is_depth,
++          key.resource_format, rectangle.row_first, rectangle.rows, rectangle.row_first_start,
++          rectangle.row_last_end);
++    }
++  }
+   if (dump_rectangles_.empty()) {
+     return true;
+   }
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940..61fa00e 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -11,7 +11,9 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstddef>
++#include <cstdio>
+ #include <cstring>
+ #include <utility>
+ 
+@@ -991,8 +993,20 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
+   TextureKey key;
+   BindingInfoFromFetchConstant(fetch, key, nullptr);
+   if (!key.is_valid || key.base_page == 0 || key.dimension != xenos::DataDimension::k2DOrStacked) {
++    if (std::getenv("TEKKEN6_TRACE_SWAP") != nullptr) {
++      REXGPU_WARN("T6 swap fetch rejected valid={} base_page={:X} dimension={} width={} height={}",
++                  bool(key.is_valid), uint32_t(key.base_page), uint32_t(key.dimension), key.GetWidth(),
++                  key.GetHeight());
++    }
+     return nullptr;
+   }
++  if (std::getenv("TEKKEN6_TRACE_SWAP") != nullptr) {
++    REXGPU_INFO(
++        "T6 swap fetch base_page={:X} mip_page={:X} size={}x{} pitch={} format={} tiled={} packed_mips={} scaled_resolve={} endianness={} fetch={:08X}/{:08X}/{:08X}/{:08X}",
++        uint32_t(key.base_page), uint32_t(key.mip_page), key.GetWidth(), key.GetHeight(), uint32_t(key.pitch),
++        uint32_t(key.format), bool(key.tiled), bool(key.packed_mips), bool(key.scaled_resolve),
++        uint32_t(key.endianness), fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3);
++  }
+   VulkanTexture* texture = static_cast<VulkanTexture*>(FindOrCreateTexture(key));
+   if (!texture) {
+     return VK_NULL_HANDLE;
+@@ -1218,6 +1232,38 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
+ 
++  // The startup logo is a small, stable diagnostic target. Capture the
++  // resident guest bytes once before the Vulkan upload so we can distinguish
++  // bad resource publication from texture sampling/rasterization problems.
++  if (texture_key.base_page == 0x10BC4 && std::getenv("TEKKEN6_DUMP_LOGO_TEX") != nullptr) {
++    static std::atomic<bool> dumped_logo{false};
++    bool expected = false;
++    if (dumped_logo.compare_exchange_strong(expected, true)) {
++      constexpr uint32_t kLogoBytes = 0x10000;
++      const uint8_t* logo = shared_memory().DebugTranslatePhysical(0x10BC4000);
++      uint32_t hash = 2166136261u;
++      uint32_t nonzero = 0;
++      uint8_t min_byte = 0xFF;
++      uint8_t max_byte = 0;
++      for (uint32_t i = 0; i < kLogoBytes; ++i) {
++        hash ^= logo[i];
++        hash *= 16777619u;
++        nonzero += logo[i] != 0;
++        min_byte = std::min(min_byte, logo[i]);
++        max_byte = std::max(max_byte, logo[i]);
++      }
++      if (FILE* dump = std::fopen("/tmp/tekken6_logo_10bc4000.bin", "wb")) {
++        std::fwrite(logo, 1, kLogoBytes, dump);
++        std::fclose(dump);
++      }
++      REXGPU_INFO(
++          "T6 logo resident bytes base=10BC4000 size={} hash={:08X} nonzero={} min={} max={} "
++          "head={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
++          kLogoBytes, hash, nonzero, uint32_t(min_byte), uint32_t(max_byte), logo[0], logo[1],
++          logo[2], logo[3], logo[4], logo[5], logo[6], logo[7]);
++    }
++  }
++
+   // Get the pipeline.
+   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
+   bool host_format_is_signed;
+@@ -1267,6 +1313,22 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+ 
+   // Get the guest layout.
+   const texture_util::TextureGuestLayout& guest_layout = vulkan_texture.guest_layout();
++  if (texture_key.base_page == 0x10BC4 &&
++      std::getenv("TEKKEN6_TRACE_LOGO_LOAD") != nullptr) {
++    REXGPU_INFO(
++        "T6 logo load base={:08X} size={}x{} fmt={} dim={} tiled={} pitch={} endian={} "
++        "mips={} load_base={} load_mips={} shader={} host_fmt={} host_bc={} "
++        "guest_base_pitch={} guest_base_z={} guest_base_extent={}x{}x{}",
++        texture_key.base_page << 12, texture_key.GetWidth(), texture_key.GetHeight(),
++        uint32_t(texture_key.format), uint32_t(texture_key.dimension), uint32_t(texture_key.tiled),
++        uint32_t(texture_key.pitch), uint32_t(texture_key.endianness),
++        uint32_t(texture_key.mip_max_level),
++        uint32_t(load_base), uint32_t(load_mips), uint32_t(load_shader),
++        uint32_t(host_format.format), uint32_t(host_format.block_compressed),
++        guest_layout.base.row_pitch_bytes, guest_layout.base.z_slice_stride_block_rows,
++        guest_layout.base.x_extent_blocks, guest_layout.base.y_extent_blocks,
++        guest_layout.base.z_extent);
++  }
+   xenos::DataDimension dimension = texture_key.dimension;
+   bool is_3d = dimension == xenos::DataDimension::k3D;
+   bool is_3d_tiling = is_3d || vulkan_texture.force_load_3d_tiling();
+@@ -3173,6 +3235,15 @@ bool VulkanTextureCache::Initialize() {
+ const VulkanTextureCache::HostFormatPair& VulkanTextureCache::GetHostFormatPair(
+     TextureKey key) const {
+   const HostFormatPair& host_format_pair = host_formats_[uint32_t(key.format)];
++  // Diagnostic A/B for the retail startup logo.  Its guest bytes are known
++  // good, so route only this texture through the existing DXT1->RGBA8 path to
++  // distinguish the direct BC1 upload from shader/rasterization problems.
++  if (key.base_page == 0x10BC4 &&
++      std::getenv("TEKKEN6_FORCE_LOGO_DXT1_RGBA") != nullptr &&
++      (key.format == xenos::TextureFormat::k_DXT4_5 ||
++       key.format == xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)) {
++    return kHostFormatDXT4_5Unaligned;
++  }
+   if (!host_format_pair.format_unsigned.block_compressed &&
+       !host_format_pair.format_signed.block_compressed) {
+     return host_format_pair;
+diff --git a/src/input/xinput/xinput_input_driver.cpp b/src/input/xinput/xinput_input_driver.cpp
+index a6a1da9..45c242a 100644
+--- a/src/input/xinput/xinput_input_driver.cpp
++++ b/src/input/xinput/xinput_input_driver.cpp
+@@ -115,12 +115,12 @@ X_STATUS XinputInputDriver::Setup() {
+   }
+ 
+   module_ = module;
+-  XInputGetCapabilities_ = xigc;
+-  XInputGetState_ = xigs;
+-  XInputGetStateEx_ = xigsEx;
+-  XInputGetKeystroke_ = xigk;
+-  XInputSetState_ = xiss;
+-  XInputEnable_ = xie;
++  XInputGetCapabilities_ = reinterpret_cast<void*>(xigc);
++  XInputGetState_ = reinterpret_cast<void*>(xigs);
++  XInputGetStateEx_ = reinterpret_cast<void*>(xigsEx);
++  XInputGetKeystroke_ = reinterpret_cast<void*>(xigk);
++  XInputSetState_ = reinterpret_cast<void*>(xiss);
++  XInputEnable_ = reinterpret_cast<void*>(xie);
+ 
+   return X_STATUS_SUCCESS;
+ }
+diff --git a/src/kernel/xam/xam_task.cpp b/src/kernel/xam/xam_task.cpp
+index e0e7dab..378c809 100644
+--- a/src/kernel/xam/xam_task.cpp
++++ b/src/kernel/xam/xam_task.cpp
+@@ -66,7 +66,11 @@ u32 XamTaskSchedule_entry(mapped_void callback, ppc_ptr_t<XTASK_MESSAGE> message
+     return result;
+   }
+ 
+-  REXKRNL_DEBUG("XAM task ({:08X}) scheduled asynchronously", callback.guest_address());
++  if (std::getenv("TEKKEN6_TRACE_XAM_TASK")) {
++    REXKRNL_INFO("T6 XAM task scheduled callback={:08X} message={:08X} handle={:08X}",
++                 callback.guest_address(), message.guest_address(),
++                 handle_ptr ? static_cast<uint32_t>(*handle_ptr) : 0);
++  }
+ 
+   return X_STATUS_SUCCESS;
+ }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index cce4f65..71bea5d 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -12,6 +12,10 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <cstdlib>
++#include <cstring>
++#include <atomic>
++
+ #include <rex/filesystem/device.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -26,12 +30,60 @@
+ #include <rex/system/xiocompletion.h>
+ #include <rex/system/xsymboliclink.h>
+ #include <rex/system/xthread.h>
++#include <rex/system/thread_state.h>
+ #include <rex/system/xtypes.h>
+ #include <rex/thread/mutex.h>
+ 
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
++// Opt-in startup I/O boundary trace. One slot covers request and completion,
++// so a busy title cannot turn a short diagnostic run into an unbounded log.
++static std::atomic<uint32_t> tekken6_io_trace_count{0};
++static std::atomic<uint64_t> tekken6_movie_io_trace_count{0};
++static int Tekken6IoTraceSlot() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("TEKKEN6_TRACE_IO");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  if (!enabled) return -1;
++  const uint32_t slot = tekken6_io_trace_count.fetch_add(1, std::memory_order_relaxed);
++  return slot < 256 ? static_cast<int>(slot) : -1;
++}
++
++static uint32_t Tekken6IoCaller() {
++  auto* state = rex::runtime::ThreadState::Get();
++  const uint64_t lr = state ? state->context()->lr : 0;
++  // Imports are called with a branch-and-link; LR - 4 is the call site.
++  return lr >= 4 ? static_cast<uint32_t>(lr - 4) : 0;
++}
++
++static uint32_t Tekken6IoThread() {
++  auto* state = rex::runtime::ThreadState::Get();
++  return state ? state->thread_id() : 0;
++}
++
++static uint32_t Tekken6IoLoadU32(uint32_t guest_address) {
++  if (!guest_address) return 0;
++  auto* host_address = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(guest_address);
++  return memory::load_and_swap<uint32_t>(host_address);
++}
++
++static bool Tekken6MovieIoTraceEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("TEKKEN6_TRACE_MOVIE");
++    return value && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++static bool Tekken6IsMovieBank(const XFile* file) {
++  if (!file) return false;
++  const auto& name = file->name();
++  return name == "DATA315.BIN" || name == "DATA316.BIN" || name == "DATA317.BIN" ||
++         name == "DATA318.BIN" || name == "DATA319.BIN" || name == "DATA320.BIN";
++}
++
+ struct CreateOptions {
+   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
+   static const uint32_t FILE_DIRECTORY_FILE = 0x00000001;
+@@ -105,6 +157,18 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
+                        u32 file_attributes, u32 share_access, u32 creation_disposition,
+                        u32 create_options) {
++  const int io_trace = Tekken6IoTraceSlot();
++  const uint32_t caller = io_trace >= 0 ? Tekken6IoCaller() : 0;
++  const uint32_t thread = io_trace >= 0 ? Tekken6IoThread() : 0;
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} create request pc={:08X} thid={} attrs={:08X} "
++                 "root={:08X} disp={:X} opts={:08X}", io_trace, caller, thread,
++                 object_attrs.guest_address(), object_attrs ? (uint32_t)object_attrs->root_directory : 0,
++                 creation_disposition, create_options);
++  }
++  REXKRNL_TRACE("[Tekken6] NtCreateFile attrs={:08X} iosb={:08X} disp={} opts={:08X}",
++                object_attrs.guest_address(), io_status_block.guest_address(),
++                creation_disposition, create_options);
+   // note used. maybe later
+   // uint64_t allocation_size = 0;  // is this correct???
+   // if (allocation_size_ptr) {
+@@ -113,6 +177,8 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+ 
+   if (!object_attrs) {
+     // ..? Some games do this. This parameter is not optional.
++    if (io_trace >= 0) REXKRNL_INFO("T6IO #{:03} create complete status={:08X}",
++                                    io_trace, uint32_t(X_STATUS_INVALID_PARAMETER));
+     return X_STATUS_INVALID_PARAMETER;
+   }
+   assert_not_null(handle_out);
+@@ -130,6 +196,8 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+ 
+   // Enforce that the path is ASCII.
+   if (!IsValidPath(target_path, false)) {
++    if (io_trace >= 0) REXKRNL_INFO("T6IO #{:03} create complete path='{}' status={:08X}",
++                                    io_trace, target_path, uint32_t(X_STATUS_OBJECT_NAME_INVALID));
+     return X_STATUS_OBJECT_NAME_INVALID;
+   }
+ 
+@@ -173,21 +241,73 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+   } else {
+     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+   }
++  REXKRNL_TRACE("[Tekken6] NtCreateFile path='{}' -> result={:08X} handle={:08X}", target_path,
++                result, handle);
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} create complete path='{}' root={:08X} "
++                 "status={:08X} handle={:08X} iosb={:08X}/{:X}",
++                 io_trace, target_path, (uint32_t)object_attrs->root_directory,
++                 uint32_t(result), uint32_t(handle),
++                 io_status_block ? uint32_t(io_status_block->status) : 0,
++                 io_status_block ? uint32_t(io_status_block->information) : 0);
++  }
+   return result;
+ }
+ 
+ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+                      ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attributes,
+                      ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, u32 open_options) {
+-  return NtCreateFile_entry(handle_out, desired_access, object_attributes, io_status_block, nullptr,
+-                            0, 0, static_cast<uint32_t>(rex::filesystem::FileDisposition::kOpen),
+-                            open_options);
++  const int io_trace = Tekken6IoTraceSlot();
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} open request pc={:08X} thid={} attrs={:08X} "
++                 "root={:08X} opts={:08X}", io_trace, Tekken6IoCaller(),
++                 Tekken6IoThread(), object_attributes.guest_address(),
++                 object_attributes ? (uint32_t)object_attributes->root_directory : 0,
++                 open_options);
++  }
++  auto result = NtCreateFile_entry(handle_out, desired_access, object_attributes, io_status_block,
++                                   nullptr, 0, 0,
++                                   static_cast<uint32_t>(rex::filesystem::FileDisposition::kOpen),
++                                   open_options);
++  REXKRNL_TRACE("[Tekken6] NtOpenFile -> result={:08X} handle={:08X}", result,
++                handle_out ? static_cast<uint32_t>(*handle_out) : 0u);
++  if (io_trace >= 0) REXKRNL_INFO("T6IO #{:03} open complete status={:08X} handle={:08X}",
++                                  io_trace, uint32_t(result),
++                                  handle_out ? uint32_t(*handle_out) : 0);
++  return result;
+ }
+ 
+ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
+                      mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
++  const int io_trace = Tekken6IoTraceSlot();
++  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
++  const bool movie_trace = Tekken6MovieIoTraceEnabled() && Tekken6IsMovieBank(file.get());
++  const uint64_t movie_io_sequence = movie_trace
++                                         ? tekken6_movie_io_trace_count.fetch_add(
++                                               1, std::memory_order_relaxed) + 1
++                                         : 0;
+   uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} read request pc={:08X} thid={} handle={:08X} "
++                 "offset={} len={:X} event={:08X} apc={:08X} iosb={:08X}",
++                 io_trace, Tekken6IoCaller(), Tekken6IoThread(), uint32_t(file_handle),
++                 byte_offset_ptr ? static_cast<int64_t>(byte_offset) : -1,
++                 uint32_t(buffer_length), uint32_t(event_handle),
++                 apc_routine_ptr.guest_address(), io_status_block.guest_address());
++  }
++  if (movie_trace) {
++    REXKRNL_INFO("T6MOVIEIO #{} read request bank='{}' pc={:08X} thid={} handle={:08X} "
++                 "buffer={:08X} offset={} len={:X} event={:08X} apc={:08X} iosb={:08X}",
++                 movie_io_sequence, file->name(), Tekken6IoCaller(), Tekken6IoThread(),
++                 uint32_t(file_handle), buffer.guest_address(),
++                 byte_offset_ptr ? static_cast<int64_t>(byte_offset) : -1,
++                 uint32_t(buffer_length), uint32_t(event_handle),
++                 apc_routine_ptr.guest_address(), io_status_block.guest_address());
++  }
++  REXKRNL_TRACE("[Tekken6] NtReadFile handle={:08X} event={:08X} buf={:08X} len={:X} offset={}",
++                file_handle, event_handle, buffer.guest_address(), buffer_length,
++                byte_offset_ptr ? static_cast<int64_t>(byte_offset) : -1);
+   const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
+   REXKRNL_IMPORT_TRACE(
+       "NtReadFile",
+@@ -204,7 +324,6 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
+     result = X_STATUS_INVALID_HANDLE;
+   }
+ 
+-  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+   if (!file) {
+     result = X_STATUS_INVALID_HANDLE;
+   }
+@@ -293,12 +412,60 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
+     REXKRNL_IMPORT_RESULT("NtReadFile", "{:#x} (apc_requested={}, apc_queued={})", result,
+                           apc_requested, apc_queued);
+   }
++  REXKRNL_TRACE("[Tekken6] NtReadFile -> result={:08X} bytes={}", result,
++                io_status_block ? static_cast<uint32_t>(io_status_block->information) : 0u);
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} read complete status={:08X} iosb={:08X}/{:X} "
++                 "event_set={} apc_queued={} data={:08X}/{:08X}/{:08X}/{:08X}", io_trace, uint32_t(result),
++                 io_status_block ? uint32_t(io_status_block->status) : 0,
++                 io_status_block ? uint32_t(io_status_block->information) : 0,
++                 ev && signal_event, apc_queued,
++                 buffer_length >= 4 ? Tekken6IoLoadU32(buffer.guest_address()) : 0,
++                 buffer_length >= 8 ? Tekken6IoLoadU32(buffer.guest_address() + 4) : 0,
++                 buffer_length >= 12 ? Tekken6IoLoadU32(buffer.guest_address() + 8) : 0,
++                 buffer_length >= 16 ? Tekken6IoLoadU32(buffer.guest_address() + 12) : 0);
++  }
++  if (movie_trace) {
++    REXKRNL_INFO("T6MOVIEIO #{} read complete bank='{}' result={:08X} iosb={:08X}/{:X} "
++                 "event_set={} apc_queued={} data={:08X}/{:08X}/{:08X}/{:08X}",
++                 movie_io_sequence, file->name(), uint32_t(result),
++                 io_status_block ? uint32_t(io_status_block->status) : 0,
++                 io_status_block ? uint32_t(io_status_block->information) : 0,
++                 ev && signal_event, apc_queued,
++                 buffer_length >= 4 ? Tekken6IoLoadU32(buffer.guest_address()) : 0,
++                 buffer_length >= 8 ? Tekken6IoLoadU32(buffer.guest_address() + 4) : 0,
++                 buffer_length >= 12 ? Tekken6IoLoadU32(buffer.guest_address() + 8) : 0,
++                 buffer_length >= 16 ? Tekken6IoLoadU32(buffer.guest_address() + 12) : 0);
++  }
+   return result;
+ }
+ 
+ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
+                             mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                             mapped_u32 segment_array, u32 length, mapped_u64 byte_offset_ptr) {
++  const int io_trace = Tekken6IoTraceSlot();
++  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
++  const bool movie_trace = Tekken6MovieIoTraceEnabled() && Tekken6IsMovieBank(file.get());
++  const uint64_t movie_io_sequence = movie_trace
++                                         ? tekken6_movie_io_trace_count.fetch_add(
++                                               1, std::memory_order_relaxed) + 1
++                                         : 0;
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} scatter request pc={:08X} thid={} handle={:08X} "
++                 "offset={} len={:X} event={:08X} apc={:08X}",
++                 io_trace, Tekken6IoCaller(), Tekken6IoThread(), uint32_t(file_handle),
++                 byte_offset_ptr ? static_cast<int64_t>(*byte_offset_ptr) : -1,
++                 uint32_t(length), uint32_t(event_handle), apc_routine_ptr.guest_address());
++  }
++  if (movie_trace) {
++    REXKRNL_INFO("T6MOVIEIO #{} scatter request bank='{}' pc={:08X} thid={} handle={:08X} "
++                 "segments={:08X} offset={} len={:X} event={:08X} apc={:08X}",
++                 movie_io_sequence, file->name(), Tekken6IoCaller(), Tekken6IoThread(),
++                 uint32_t(file_handle), segment_array.guest_address(),
++                 byte_offset_ptr ? static_cast<int64_t>(static_cast<uint64_t>(*byte_offset_ptr))
++                                 : -1,
++                 uint32_t(length), uint32_t(event_handle), apc_routine_ptr.guest_address());
++  }
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   bool signal_event = false;
+@@ -307,7 +474,6 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
+     result = X_STATUS_INVALID_HANDLE;
+   }
+ 
+-  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+   if (!file) {
+     result = X_STATUS_INVALID_HANDLE;
+   }
+@@ -376,6 +542,22 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
+     ev->Set(0, false);
+   }
+ 
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} scatter complete status={:08X} iosb={:08X}/{:X} "
++                 "event_set={}", io_trace, uint32_t(result),
++                 io_status_block ? uint32_t(io_status_block->status) : 0,
++                 io_status_block ? uint32_t(io_status_block->information) : 0,
++                 ev && signal_event);
++  }
++  if (movie_trace) {
++    REXKRNL_INFO("T6MOVIEIO #{} scatter complete bank='{}' result={:08X} iosb={:08X}/{:X} "
++                 "event_set={}",
++                 movie_io_sequence, file->name(), uint32_t(result),
++                 io_status_block ? uint32_t(io_status_block->status) : 0,
++                 io_status_block ? uint32_t(io_status_block->information) : 0,
++                 ev && signal_event);
++  }
++
+   return result;
+ }
+ 
+@@ -560,7 +742,14 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
+                                ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                                ppc_ptr_t<X_FILE_DIRECTORY_INFORMATION> file_info_ptr, u32 length,
+                                ppc_ptr_t<X_ANSI_STRING> file_name, u32 restart_scan) {
++  const int io_trace = Tekken6IoTraceSlot();
++  const uint32_t caller = io_trace >= 0 ? Tekken6IoCaller() : 0;
++  const uint32_t thread = io_trace >= 0 ? Tekken6IoThread() : 0;
+   if (length < 72) {
++    if (io_trace >= 0) {
++      REXKRNL_INFO("T6IO #{:03} query-dir request pc={:08X} thid={} handle={:08X} len={} restart={} -> length-mismatch",
++                   io_trace, caller, thread, file_handle, length, restart_scan);
++    }
+     return X_STATUS_INFO_LENGTH_MISMATCH;
+   }
+ 
+@@ -570,6 +759,11 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
+   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+   auto name = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), file_name);
+ 
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} query-dir request pc={:08X} thid={} handle={:08X} name='{}' len={} restart={}",
++                 io_trace, caller, thread, file_handle, name, length, restart_scan);
++  }
++
+   // Enforce that the path is ASCII.
+   if (!IsValidPath(name, true)) {
+     return X_STATUS_INVALID_PARAMETER;
+@@ -594,6 +788,12 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
+     io_status_block->information = info;
+   }
+ 
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} query-dir complete status={:08X} iosb={:08X}/{}",
++                 io_trace, uint32_t(result), io_status_block ? uint32_t(io_status_block.guest_address()) : 0,
++                 info);
++  }
++
+   return result;
+ }
+ 
+@@ -677,6 +877,19 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
+                                 u32 io_status_block, u32 io_control_code, mapped_void input_buffer,
+                                 u32 input_buffer_len, mapped_void output_buffer,
+                                 u32 output_buffer_len) {
++  const int io_trace = Tekken6IoTraceSlot();
++  if (io_trace >= 0) {
++    REXKRNL_INFO("T6IO #{:03} ioctl request pc={:08X} thid={} handle={:08X} "
++                 "code={:08X} in={:X} out={:X} event={:08X} iosb={:08X}",
++                 io_trace, Tekken6IoCaller(), Tekken6IoThread(), uint32_t(handle),
++                 uint32_t(io_control_code), uint32_t(input_buffer_len),
++                 uint32_t(output_buffer_len), uint32_t(event_handle), uint32_t(io_status_block));
++  }
++  REXKRNL_TRACE("[Tekken6] NtDeviceIoControlFile handle={:08X} event={:08X} code={:08X}",
++                handle, event_handle, io_control_code);
++  REXKRNL_TRACE("[Tekken6] NtDeviceIoControlFile args iosb={:08X} in={:08X}/{} out={:08X}/{}",
++                io_status_block, input_buffer.guest_address(), input_buffer_len,
++                output_buffer.guest_address(), output_buffer_len);
+   // Called by XMountUtilityDrive cache-mounting code
+   // (checks if the returned values look valid, values below seem to pass the
+   // checks)
+@@ -684,6 +897,49 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
+ 
+   const uint32_t X_IOCTL_DISK_GET_DRIVE_GEOMETRY = 0x70000;
+   const uint32_t X_IOCTL_DISK_GET_PARTITION_INFO = 0x74004;
++  // Private Xbox storage bootstrap probe used by Tekken 6 when opening the
++  // optical-image device.  It has no payload; the title only requires a
++  // successful IOSB and completion event before it proceeds to DINF/DATA I/O.
++  const uint32_t X_IOCTL_IMAGE_MOUNT_PROBE = 0x00024400;
++
++  if (io_control_code == X_IOCTL_IMAGE_MOUNT_PROBE) {
++    auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(handle);
++    if (!file) {
++      REXKRNL_IMPORT_FAIL("NtDeviceIoControlFile",
++                          "storage probe handle={:#x} -> invalid handle", handle);
++      if (io_trace >= 0) REXKRNL_INFO("T6IO #{:03} ioctl complete status={:08X}",
++                                      io_trace, uint32_t(X_STATUS_INVALID_HANDLE));
++      return X_STATUS_INVALID_HANDLE;
++    }
++
++    auto iosb = io_status_block
++                    ? REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block)
++                    : nullptr;
++    if (iosb) {
++      iosb->status = X_STATUS_SUCCESS;
++      iosb->information = 0;
++    }
++
++    if (event_handle) {
++      auto event = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
++      if (!event) {
++        REXKRNL_IMPORT_FAIL("NtDeviceIoControlFile",
++                            "storage probe event={:#x} -> invalid handle", event_handle);
++        if (io_trace >= 0) REXKRNL_INFO("T6IO #{:03} ioctl complete status={:08X}",
++                                        io_trace, uint32_t(X_STATUS_INVALID_HANDLE));
++        return X_STATUS_INVALID_HANDLE;
++      }
++      event->Set(0, false);
++    }
++
++    REXKRNL_IMPORT_RESULT("NtDeviceIoControlFile",
++                          "storage probe handle={:#x} code={:#x} -> success", handle,
++                          io_control_code);
++    REXKRNL_TRACE("[Tekken6] NtDeviceIoControlFile -> storage probe success");
++    if (io_trace >= 0) REXKRNL_INFO("T6IO #{:03} ioctl complete status=00000000 "
++                                    "iosb=00000000/0 event_set={}", io_trace, event_handle != 0);
++    return X_STATUS_SUCCESS;
++  }
+ 
+   if (io_control_code == X_IOCTL_DISK_GET_DRIVE_GEOMETRY) {
+     if (output_buffer_len < 0x8) {
+@@ -692,6 +948,12 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
+     }
+     memory::store_and_swap<uint32_t>(output_buffer, cache_size / 512);
+     memory::store_and_swap<uint32_t>(output_buffer + 4, 512);
++    if (io_status_block) {
++      auto* iosb = REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block);
++      iosb->status = X_STATUS_SUCCESS;
++      iosb->information = 8;
++    }
++    REXKRNL_TRACE("[Tekken6] NtDeviceIoControlFile geometry -> status=00000000 bytes=8");
+   } else if (io_control_code == X_IOCTL_DISK_GET_PARTITION_INFO) {
+     if (output_buffer_len < 0x10) {
+       assert_always();
+@@ -699,12 +961,32 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
+     }
+     memory::store_and_swap<uint64_t>(output_buffer, 0);
+     memory::store_and_swap<uint64_t>(output_buffer + 8, cache_size);
++    if (io_status_block) {
++      auto* iosb = REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block);
++      iosb->status = X_STATUS_SUCCESS;
++      iosb->information = 16;
++    }
++    REXKRNL_TRACE("[Tekken6] NtDeviceIoControlFile partition -> status=00000000 bytes=16");
+   } else {
+     REXKRNL_DEBUG("NtDeviceIoControlFile(0x{:X}) - unhandled IOCTL!", uint32_t(io_control_code));
+     assert_always();
++    if (io_trace >= 0) REXKRNL_INFO("T6IO #{:03} ioctl complete status={:08X}",
++                                    io_trace, uint32_t(X_STATUS_INVALID_PARAMETER));
+     return X_STATUS_INVALID_PARAMETER;
+   }
+ 
++  if (io_trace >= 0) {
++    auto* iosb = io_status_block
++        ? REX_KERNEL_MEMORY()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block) : nullptr;
++    REXKRNL_INFO("T6IO #{:03} ioctl complete status=00000000 iosb={:08X}/{:X} "
++                 "out={:08X}/{:08X}/{:08X}/{:08X}",
++                 io_trace, iosb ? uint32_t(iosb->status) : 0,
++                 iosb ? uint32_t(iosb->information) : 0,
++                 output_buffer_len >= 4 ? Tekken6IoLoadU32(output_buffer.guest_address()) : 0,
++                 output_buffer_len >= 8 ? Tekken6IoLoadU32(output_buffer.guest_address() + 4) : 0,
++                 output_buffer_len >= 12 ? Tekken6IoLoadU32(output_buffer.guest_address() + 8) : 0,
++                 output_buffer_len >= 16 ? Tekken6IoLoadU32(output_buffer.guest_address() + 12) : 0);
++  }
+   return X_STATUS_SUCCESS;
+ }
+ 
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+index bd5de65..6c58266 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+@@ -12,6 +12,9 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <atomic>
++#include <cstdlib>
++
+ #include <rex/filesystem/device.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -149,6 +152,29 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
+       break;
+     }
+     case XFileXctdCompressionInformation: {
++      if (std::getenv("TEKKEN6_TRACE_XCTD") != nullptr) {
++        static std::atomic<uint32_t> xctd_trace_count{0};
++        const uint32_t trace_index = xctd_trace_count.fetch_add(1);
++        if (trace_index < 64) {
++          auto* thread = XThread::GetCurrentThread();
++          auto* context = thread ? thread->thread_state()->context() : nullptr;
++          REXKRNL_INFO(
++              "T6 XCTD #{} handle={:08X} path={} info_length={} caller_lr={:016X} thread={:08X}",
++              trace_index, file_handle, file->path(), info_length,
++              context ? context->lr : 0, thread ? thread->guest_object() : 0);
++        }
++      }
++      // The opt-in DATA bridge serves extracted DATA banks as decoded
++      // streams.  Tell the guest that the kernel should not transparently
++      // decompress those reads.  The default remains the strict stub.
++      if (std::getenv("TEKKEN6_XCTD_REPORT_UNCOMPRESSED") != nullptr &&
++          std::getenv("TEK6_RUNTIME_TD_IDX_BRIDGE") != nullptr) {
++        auto info = info_ptr.as<X_FILE_XCTD_COMPRESSION_INFORMATION*>();
++        info->unknown = 0;
++        out_length = sizeof(*info);
++        REXKRNL_INFO("T6 XCTD report uncompressed path={} status=success", file->path());
++        break;
++      }
+       REXKRNL_ERROR(
+           "NtQueryInformationFile(XFileXctdCompressionInformation) "
+           "unimplemented");
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_ob.cpp b/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
+index 5709e6d..98b9a8e 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
+@@ -181,6 +181,8 @@ u32 ObCreateSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr,
+     path = path.substr(4);  // Strip the full qualifier
+   }
+ 
++  REXKRNL_TRACE("[Tekken6] ObCreateSymbolicLink path='{}' target='{}'", path, target);
++
+   if (!REX_KERNEL_FS()->RegisterSymbolicLink(path, target)) {
+     return X_STATUS_UNSUCCESSFUL;
+   }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..92fe40d 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -125,7 +125,16 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
+   // Determine target process based on creation flags.
+   uint32_t guest_process = REX_KERNEL_STATE()->GetTitleProcess();
+   if (creation_flags & 2) {
+-    REXKRNL_WARN("[ExCreateThread] Guest is creating a system thread!");
++    if (std::getenv("TEKKEN6_TRACE_THREADS") != nullptr) {
++      REXKRNL_WARN(
++          "[ExCreateThread] system thread start={:#x} context={:#x} startup={:#x} "
++          "stack={:#x} flags={:#x}",
++          start_address.guest_address(), start_context.guest_address(),
++          static_cast<uint32_t>(xapi_thread_startup), static_cast<uint32_t>(stack_size),
++          static_cast<uint32_t>(creation_flags));
++    } else {
++      REXKRNL_WARN("[ExCreateThread] Guest is creating a system thread!");
++    }
+     guest_process = REX_KERNEL_STATE()->GetSystemProcess();
+   }
+ 
+@@ -473,7 +482,17 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
+ }
+ 
+ u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+-  return xeKeSetEvent(event_ptr, increment, wait);
++  static const bool trace_tekken_event = std::getenv("TEKKEN6_TRACE_EVENT_SIGNAL") != nullptr;
++  static std::atomic<uint32_t> trace_tekken_event_count{0};
++  if (trace_tekken_event && trace_tekken_event_count.fetch_add(1) < 256) {
++    REXKRNL_TRACE("[Tekken6] KeSetEvent signal event={:08X} increment={} wait={}",
++                  event_ptr.guest_address(), increment, wait);
++  }
++  REXKRNL_IMPORT_TRACE("KeSetEvent", "event={:#x} increment={} wait={}",
++                       event_ptr.guest_address(), increment, wait);
++  auto result = xeKeSetEvent(event_ptr, increment, wait);
++  REXKRNL_IMPORT_RESULT("KeSetEvent", "{:#x}", result);
++  return result;
+ }
+ 
+ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+@@ -498,6 +517,8 @@ u32 KeResetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr) {
+ 
+ u32 NtCreateEvent_entry(mapped_u32 handle_ptr, ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
+                         u32 event_type, u32 initial_state) {
++  REXKRNL_TRACE("[Tekken6] NtCreateEvent type={} initial={} handle_ptr={:08X}", event_type,
++                initial_state, handle_ptr.guest_address());
+   // Check for an existing timer with the same name.
+   auto existing_object =
+       LookupNamedObject<XEvent>(REX_KERNEL_STATE(), obj_attributes_ptr.guest_address());
+@@ -524,6 +545,8 @@ u32 NtCreateEvent_entry(mapped_u32 handle_ptr, ppc_ptr_t<X_OBJECT_ATTRIBUTES> ob
+   if (handle_ptr) {
+     *handle_ptr = ev->handle();
+   }
++  REXKRNL_TRACE("[Tekken6] NtCreateEvent -> handle={:08X} manual_reset={}", ev->handle(),
++                event_type == 0);
+   return X_STATUS_SUCCESS;
+ }
+ 
+@@ -532,6 +555,8 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
+ 
+   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
+   if (ev) {
++    REXKRNL_TRACE("[Tekken6] NtSetEvent host_wait={} guest_handle={:08X}",
++                  static_cast<const void*>(ev->TraceWaitHandle()), handle);
+     int32_t was_signalled = ev->Set(0, false);
+     if (previous_state_ptr) {
+       *previous_state_ptr = static_cast<uint32_t>(was_signalled);
+@@ -544,7 +569,19 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
+ }
+ 
+ u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+-  return xeNtSetEvent(handle, previous_state_ptr);
++  REXKRNL_TRACE("[Tekken6] NtSetEvent handle={:08X} previous={:08X}", handle,
++                previous_state_ptr.guest_address());
++  REXKRNL_IMPORT_TRACE("NtSetEvent", "handle={:#x} previous_state_ptr={:#x}", handle,
++                       previous_state_ptr.guest_address());
++  auto result = xeNtSetEvent(handle, previous_state_ptr);
++  uint32_t previous_value = 0xFFFFFFFFu;
++  if (previous_state_ptr) {
++    previous_value = static_cast<uint32_t>(*previous_state_ptr);
++  }
++  REXKRNL_TRACE("[Tekken6] NtSetEvent -> result={:08X} previous_value={:08X}", result,
++                previous_value);
++  REXKRNL_IMPORT_RESULT("NtSetEvent", "{:#x}", result);
++  return result;
+ }
+ 
+ u32 NtPulseEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+@@ -618,6 +655,8 @@ u32 KeReleaseSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 incremen
+ 
+ u32 NtCreateSemaphore_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u32 count,
+                             u32 limit) {
++  REXKRNL_TRACE("[Tekken6] NtCreateSemaphore count={} limit={} handle_ptr={:08X}", count,
++                limit, handle_ptr.guest_address());
+   // Check for an existing semaphore with the same name.
+   auto existing_object =
+       LookupNamedObject<XSemaphore>(REX_KERNEL_STATE(), obj_attributes_ptr.guest_address());
+@@ -651,10 +690,15 @@ u32 NtCreateSemaphore_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_pt
+     *handle_ptr = sem->handle();
+   }
+ 
++  REXKRNL_TRACE("[Tekken6] NtCreateSemaphore -> handle={:08X} count={} limit={}", sem->handle(),
++                count, limit);
++
+   return X_STATUS_SUCCESS;
+ }
+ 
+ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previous_count_ptr) {
++  REXKRNL_TRACE("[Tekken6] NtReleaseSemaphore handle={:08X} release={} previous_ptr={:08X}",
++                sem_handle, release_count, previous_count_ptr.guest_address());
+   X_STATUS result = X_STATUS_SUCCESS;
+   int32_t previous_count = 0;
+ 
+@@ -671,6 +715,9 @@ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previ
+     *previous_count_ptr = (uint32_t)previous_count;
+   }
+ 
++  REXKRNL_TRACE("[Tekken6] NtReleaseSemaphore -> result={:08X} previous={} handle={:08X}",
++                result, previous_count, sem_handle);
++
+   return result;
+ }
+ 
+@@ -839,14 +886,13 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
+ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
+                                 u32 alertable, mapped_u64 timeout_ptr) {
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+-  // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
+-  // timeout={}",
+-  // object_ptr.guest_address(), (uint32_t)wait_reason,
+-  //(uint32_t)processor_mode, (uint32_t)alertable,
+-  // timeout_ptr ? (int64_t)timeout : -1);
++  REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={} timeout={}",
++  object_ptr.guest_address(), (uint32_t)wait_reason,
++  (uint32_t)processor_mode, (uint32_t)alertable,
++  timeout_ptr ? (int64_t)timeout : -1);
+   auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
+                                         timeout_ptr ? &timeout : nullptr);
+-  // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
++  REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
+   return result;
+ }
+ 
+@@ -854,6 +900,11 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+                                   mapped_u64 timeout_ptr) {
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
++  REXKRNL_IMPORT_TRACE("NtWaitForSingleObjectEx",
++                       "handle={:#x} mode={} alertable={} timeout={}", object_handle,
++                       wait_mode, alertable,
++                       timeout_ptr ? static_cast<int64_t>(static_cast<uint64_t>(*timeout_ptr))
++                                   : -1);
+   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
+   if (object) {
+     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+@@ -865,6 +916,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+     result = X_STATUS_INVALID_HANDLE;
+   }
+ 
++  REXKRNL_IMPORT_RESULT("NtWaitForSingleObjectEx", "{:#x}", result);
+   return result;
+ }
+ 
+@@ -926,11 +978,22 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
+ 
+ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
+                                            u32 r6, mapped_u64 timeout_ptr) {
++  REXKRNL_TRACE("[Tekken6] NtSignalAndWait signal={:08X} wait={:08X} alertable={} r6={}",
++                signal_handle, wait_handle, alertable, r6);
++  REXKRNL_IMPORT_TRACE("NtSignalAndWaitForSingleObjectEx",
++                       "signal={:#x} wait={:#x} alertable={} r6={} timeout={}", signal_handle,
++                       wait_handle, alertable, r6,
++                       timeout_ptr ? static_cast<int64_t>(static_cast<uint64_t>(*timeout_ptr))
++                                   : -1);
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);
+   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
+   if (signal_object && wait_object) {
++    REXKRNL_TRACE(
++        "[Tekken6] NtSignalAndWait host_signal={} host_wait={} signal={:08X} wait={:08X}",
++        static_cast<const void*>(signal_object->TraceWaitHandle()),
++        static_cast<const void*>(wait_object->TraceWaitHandle()), signal_handle, wait_handle);
+     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+     result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
+                                     timeout_ptr ? &timeout : nullptr);
+@@ -942,6 +1005,8 @@ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u
+     XThread::GetCurrentThread()->DeliverAPCs();
+   }
+ 
++  REXKRNL_TRACE("[Tekken6] NtSignalAndWait -> result={:08X}", result);
++  REXKRNL_IMPORT_RESULT("NtSignalAndWaitForSingleObjectEx", "{:#x}", result);
+   return result;
+ }
+ 
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b93005..022c60d 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -417,6 +417,11 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     // The address is not found within any range, so either a write watch or an
+     // actual access violation.
+     if (access_violation_callback_) {
++      if (fault_guest_virtual_address == 0x10) {
++        REXLOG_ERROR("T6 fault probe guest=0x{:08X} pc=0x{:016X} host=0x{:016X} op={}",
++                     fault_guest_virtual_address, ex->pc(),
++                     static_cast<uint64_t>(ex->fault_address()), is_write ? "write" : "read");
++      }
+       return access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                         fault_host_address, is_write);
+     }
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index c10694c..60b508e 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -113,6 +113,8 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
+   thread::EnableAffinityConfiguration();
+ 
+   tool_mode_ = config.tool_mode;
++  null_device_sectors_per_allocation_unit_ =
++      config.null_device_sectors_per_allocation_unit;
+ 
+   // Create memory system first
+   memory_ = std::make_unique<memory::Memory>();
+@@ -344,7 +346,9 @@ bool Runtime::SetupVfs() {
+   // go to NullDevice (VFS resolves devices in registration order)
+   auto null_paths = {std::string("\\Partition0"), std::string("\\Cache0"), std::string("\\Cache1")};
+   auto null_device =
+-      std::make_unique<rex::filesystem::NullDevice>("\\Device\\Harddisk0", null_paths);
++      std::make_unique<rex::filesystem::NullDevice>(
++          "\\Device\\Harddisk0", null_paths,
++          null_device_sectors_per_allocation_unit_);
+   if (null_device->Initialize()) {
+     file_system_->RegisterDevice(std::move(null_device));
+     REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");
+diff --git a/src/system/thread_state.cpp b/src/system/thread_state.cpp
+index 46ab797..61121d7 100644
+--- a/src/system/thread_state.cpp
++++ b/src/system/thread_state.cpp
+@@ -33,6 +33,11 @@ ThreadState::ThreadState(uint32_t thread_id, uint32_t stack_base, uint32_t pcr_a
+ 
+   // Set initial registers
+   context_->r1.u64 = stack_base;    // Stack pointer
++  // Match Xenia's Xbox 360 thread contract.  r2 is the platform-reserved
++  // constant register (Xenia initializes it to 0x20000000); leaving it zero
++  // changes the entry environment for titles that inspect it before setting
++  // up their own register state.
++  context_->r2.u64 = 0x20000000;
+   context_->r13.u64 = pcr_address;  // PCR address
+ 
+   // Note(tomc): the rexglue abi passes memory base via 'base' parameter to each function call,
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index 4179e8b..a009434 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <rex/filesystem/vfs.h>
++#include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+@@ -19,10 +20,277 @@
+ #include <rex/system/xfile.h>
+ #include <rex/thread/mutex.h>
+ 
++#include <atomic>
++#include <cstring>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <algorithm>
++#include <memory>
++#include <mutex>
++#include <unordered_map>
+ #include <span>
++#include <string>
++#include <vector>
+ 
+ namespace rex::system {
+ 
++namespace {
++
++bool tek6_env_enabled(const char* name) {
++  const char* value = std::getenv(name);
++  return value != nullptr && (std::strcmp(value, "1") == 0 ||
++                              std::strcmp(value, "true") == 0 ||
++                              std::strcmp(value, "on") == 0);
++}
++
++bool tek6_td_source_offset(const std::string& logical_name, uint64_t offset,
++                           uint32_t length, uint64_t* source_offset) {
++  const char* spec = std::getenv("TEK6_RUNTIME_TD_REMAP");
++  if (spec == nullptr || *spec == '\0') return false;
++
++  const std::string expected_suffix = ".BIN";
++  size_t begin = 0;
++  const std::string remap_spec(spec);
++  while (begin < remap_spec.size()) {
++    const size_t comma = remap_spec.find(',', begin);
++    const size_t end = comma == std::string::npos ? remap_spec.size() : comma;
++    const std::string segment = remap_spec.substr(begin, end - begin);
++    char bank[16]{};
++    unsigned long long requested_offset = 0;
++    unsigned long long requested_length = 0;
++    unsigned long long replacement_offset = 0;
++    if (std::sscanf(segment.c_str(), "%15[^:]:%llx:%llx:%llx", bank,
++                    &requested_offset, &requested_length,
++                    &replacement_offset) == 4) {
++      const std::string expected_name = std::string(bank) + expected_suffix;
++      const uint64_t request_end = requested_offset + requested_length;
++      const uint64_t read_end = offset + length;
++      if (logical_name == expected_name && requested_length != 0 &&
++          request_end >= requested_offset && offset >= requested_offset &&
++          read_end >= offset && read_end <= request_end &&
++          replacement_offset <= UINT64_MAX - (offset - requested_offset)) {
++        *source_offset = replacement_offset + (offset - requested_offset);
++        static std::atomic<uint32_t> remap_log_count{0};
++        const uint32_t n = remap_log_count.fetch_add(1, std::memory_order_relaxed);
++        if (n < 64) {
++          std::fprintf(stderr,
++                       "[tekken6-rex] TD remap %s offset=0x%llx length=0x%x -> 0x%llx\n",
++                       logical_name.c_str(),
++                       static_cast<unsigned long long>(offset), length,
++                       static_cast<unsigned long long>(*source_offset));
++        }
++        return true;
++      }
++    }
++    if (comma == std::string::npos) break;
++    begin = comma + 1;
++  }
++  return false;
++}
++
++// XMemDecompressSegmentTD expands the DATA archive into a sparse logical
++// address space.  DATA*.IDX stores the source page in 0x8000-byte units; the
++// decoder writes each entry at raw_offset * 0x8000 in the .dec stream.  The
++// guest, however, reads logical substreams whose offsets are not generally
++// the IDX table's cumulative byte offsets.  The old bridge therefore needed
++// hand-entered (offset,length -> decoded offset) guesses.  The opt-in bridge
++// below learns those associations from unambiguous IDX sizes and keeps the
++// inferred segments per XFile.
++struct Tekken6TdIndexEntry {
++  uint32_t index = 0;
++  uint64_t decoded_start = 0;
++  uint64_t size = 0;
++};
++
++struct Tekken6TdIndexTable {
++  std::filesystem::path decoded_path;
++  uint64_t decoded_size = 0;
++  std::vector<Tekken6TdIndexEntry> entries;
++};
++
++std::mutex g_tekken6_td_index_cache_mutex;
++std::unordered_map<std::string, std::shared_ptr<const Tekken6TdIndexTable>>
++    g_tekken6_td_index_cache;
++
++bool tek6_read_be32(const std::vector<uint8_t>& bytes, size_t offset, uint32_t* value) {
++  if (offset > bytes.size() || bytes.size() - offset < 4) return false;
++  *value = (uint32_t(bytes[offset]) << 24) |
++           (uint32_t(bytes[offset + 1]) << 16) |
++           (uint32_t(bytes[offset + 2]) << 8) | uint32_t(bytes[offset + 3]);
++  return true;
++}
++
++std::shared_ptr<const Tekken6TdIndexTable> tek6_load_td_index(
++    const std::filesystem::path& bin_path) {
++  const std::filesystem::path decoded_path = [&] {
++    auto p = bin_path;
++    p.replace_extension(".dec");
++    return p;
++  }();
++  const std::string cache_key = decoded_path.lexically_normal().string();
++
++  {
++    std::lock_guard<std::mutex> lock(g_tekken6_td_index_cache_mutex);
++    auto it = g_tekken6_td_index_cache.find(cache_key);
++    if (it != g_tekken6_td_index_cache.end()) return it->second;
++  }
++
++  auto table = std::make_shared<Tekken6TdIndexTable>();
++  table->decoded_path = decoded_path;
++  std::error_code ec;
++  if (!std::filesystem::is_regular_file(decoded_path, ec)) return nullptr;
++  table->decoded_size = std::filesystem::file_size(decoded_path, ec);
++  if (ec || table->decoded_size == 0) return nullptr;
++
++  auto idx_path = bin_path;
++  idx_path.replace_extension(".IDX");
++  if (!std::filesystem::is_regular_file(idx_path, ec)) return nullptr;
++  const uint64_t idx_size = std::filesystem::file_size(idx_path, ec);
++  // IDX files are tiny (the largest local character bank is well below this),
++  // and refusing a malformed/hostile file keeps this read path bounded.
++  if (ec || idx_size == 0 || idx_size > 16 * 1024 * 1024 || (idx_size & 7) != 0) {
++    return nullptr;
++  }
++
++  std::ifstream idx(idx_path, std::ios::binary);
++  std::vector<uint8_t> bytes(static_cast<size_t>(idx_size));
++  if (!idx.read(reinterpret_cast<char*>(bytes.data()),
++                static_cast<std::streamsize>(bytes.size()))) {
++    return nullptr;
++  }
++
++  for (size_t pos = 0; pos < bytes.size(); pos += 8) {
++    uint32_t raw_offset = 0;
++    uint32_t entry_size = 0;
++    if (!tek6_read_be32(bytes, pos, &raw_offset) ||
++        !tek6_read_be32(bytes, pos + 4, &entry_size)) {
++      return nullptr;
++    }
++    if (raw_offset == 0xffffffffu || entry_size == 0 || entry_size == 0xffffffffu) {
++      continue;
++    }
++    const uint64_t decoded_start = uint64_t(raw_offset) * 0x8000ull;
++    if (decoded_start > table->decoded_size ||
++        uint64_t(entry_size) > table->decoded_size - decoded_start) {
++      // A truncated decoded bank must never cause us to read the neighbouring
++      // region.  Ignore this entry; if all useful entries are absent the
++      // bridge simply falls back to the retail/raw path.
++      continue;
++    }
++    table->entries.push_back({static_cast<uint32_t>(pos / 8), decoded_start,
++                              uint64_t(entry_size)});
++  }
++  if (table->entries.empty()) return nullptr;
++
++  std::sort(table->entries.begin(), table->entries.end(),
++            [](const Tekken6TdIndexEntry& left, const Tekken6TdIndexEntry& right) {
++              if (left.decoded_start != right.decoded_start) {
++                return left.decoded_start < right.decoded_start;
++              }
++              return left.index < right.index;
++            });
++
++  {
++    std::lock_guard<std::mutex> lock(g_tekken6_td_index_cache_mutex);
++    auto [it, inserted] = g_tekken6_td_index_cache.emplace(cache_key, table);
++    return inserted ? table : it->second;
++  }
++}
++
++bool tek6_td_idx_source_offset(const std::filesystem::path& bin_path,
++                               uint64_t logical_offset, uint32_t length,
++                               std::vector<Tekken6TdVirtualSegment>& segments,
++                               uint64_t* source_offset) {
++  if (length == 0) return false;
++  const auto table = tek6_load_td_index(bin_path);
++  if (!table) return false;
++  const uint64_t read_end = logical_offset + uint64_t(length);
++  if (read_end < logical_offset) return false;
++
++  auto add_segment = [&](const Tekken6TdIndexEntry& entry, uint64_t logical_start,
++                         uint64_t logical_length) -> bool {
++    if (logical_start > UINT64_MAX - logical_length ||
++        entry.decoded_start > table->decoded_size ||
++        uint64_t(length) > table->decoded_size - entry.decoded_start) {
++      return false;
++    }
++    // Permit a request slightly larger than an IDX entry only when the
++    // decoded file itself contains the complete requested range.  This is
++    // needed for the observed DATA301 continuation read, whose request spans
++    // the entry header and padding before the next 0x8000 page.
++    const uint64_t usable_length = std::max(logical_length, uint64_t(length));
++    if (entry.decoded_start > table->decoded_size - usable_length) return false;
++    segments.push_back({logical_start, entry.decoded_start, usable_length, entry.index});
++    *source_offset = entry.decoded_start + (logical_offset - logical_start);
++    return *source_offset <= table->decoded_size - uint64_t(length);
++  };
++
++  // An exact-size match is the strongest evidence available at this layer.
++  // Refuse duplicate sizes: guessing between repeated character records is
++  // worse than retaining the raw path and makes the bridge non-diagnostic.
++  const Tekken6TdIndexEntry* exact = nullptr;
++  size_t exact_count = 0;
++  for (const auto& entry : table->entries) {
++    if (entry.size == uint64_t(length)) {
++      exact = &entry;
++      ++exact_count;
++    }
++  }
++  if (exact_count == 1 && add_segment(*exact, logical_offset, exact->size)) {
++    return true;
++  }
++
++  // Reuse the newest inferred segment before extending a stream.  New exact
++  // anchors intentionally shadow older overlapping segments (DATA304 has
++  // several independent logical substreams in one DATA*.BIN).
++  for (auto it = segments.rbegin(); it != segments.rend(); ++it) {
++    if (logical_offset < it->logical_start ||
++        logical_offset > UINT64_MAX - uint64_t(length) ||
++        read_end > it->logical_start + it->length) {
++      continue;
++    }
++    const uint64_t delta = logical_offset - it->logical_start;
++    if (it->decoded_start > table->decoded_size - delta ||
++        uint64_t(length) > table->decoded_size - it->decoded_start - delta) {
++      continue;
++    }
++    *source_offset = it->decoded_start + delta;
++    return true;
++  }
++
++  // If no unique size identifies the first request, offset zero is still a
++  // safe anchor only for IDX entry zero.  This handles DATA302's partial read
++  // of entry zero without mistaking one of its repeated sizes for another
++  // entry.
++  if (logical_offset == 0) {
++    auto zero = std::find_if(table->entries.begin(), table->entries.end(),
++                             [](const Tekken6TdIndexEntry& entry) {
++                               return entry.decoded_start == 0;
++                             });
++    if (zero != table->entries.end() && add_segment(*zero, 0, zero->size)) {
++      return true;
++    }
++  }
++
++  // A request immediately after a known segment is commonly a short prefix
++  // of the next physical IDX region.  Follow decoded physical order, but do
++  // not bridge arbitrary gaps or unrelated reads.
++  for (auto it = segments.rbegin(); it != segments.rend(); ++it) {
++    if (logical_offset != it->logical_start + it->length) continue;
++    auto next = std::find_if(table->entries.begin(), table->entries.end(),
++                             [&](const Tekken6TdIndexEntry& entry) {
++                               return entry.decoded_start > it->decoded_start;
++                             });
++    if (next != table->entries.end() && add_segment(*next, logical_offset, next->size)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
+ XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
+     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
+   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+@@ -112,6 +380,16 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint
+ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
+                              uint64_t byte_offset, uint32_t* out_bytes_read, uint32_t apc_context,
+                              bool notify_completion) {
++  if (std::getenv("TEKKEN6_TRACE_REX_FILE") != nullptr) {
++    static std::atomic<uint32_t> read_entry_trace_count{0};
++    const uint32_t n = read_entry_trace_count.fetch_add(1, std::memory_order_relaxed);
++    if (n < 512) {
++      std::fprintf(stderr,
++                   "[tekken6-rex-read-entry] #%u name=%s path=%s guest=%08x length=0x%x offset=0x%llx\n",
++                   n, name().c_str(), path().c_str(), buffer_guest_address, buffer_length,
++                   static_cast<unsigned long long>(byte_offset));
++    }
++  }
+   if (byte_offset == uint64_t(-1)) {
+     // Read from current position.
+     byte_offset = position_;
+@@ -155,14 +433,111 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
+                                         memory::PageAccess::kReadWrite) {
+           result = X_STATUS_ACCESS_VIOLATION;
+         } else {
+-          result = file_->ReadSync(
+-              std::span<uint8_t>(
+-                  buffer_physical_heap
+-                      ? memory()->TranslatePhysical(
+-                            buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
+-                      : memory()->TranslateVirtual(buffer_guest_address),
+-                  buffer_length),
+-              size_t(byte_offset), &bytes_read);
++          uint8_t* destination =
++              buffer_physical_heap
++                  ? memory()->TranslatePhysical(
++                        buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
++                  : memory()->TranslateVirtual(buffer_guest_address);
++          uint64_t source_offset = byte_offset;
++          bool decoded_overlay = false;
++          std::string logical_name = name();
++          if (std::getenv("TEKKEN6_TRACE_REX_FILE") != nullptr) {
++            static std::atomic<uint32_t> file_trace_count{0};
++            const uint32_t n = file_trace_count.fetch_add(1, std::memory_order_relaxed);
++            if (n < 512) {
++              std::fprintf(stderr,
++                           "[tekken6-rex-file] #%u name=%s path=%s guest=0x%08x offset=0x%llx length=0x%x\n",
++                           n, logical_name.c_str(), path().c_str(),
++                           buffer_guest_address,
++                           static_cast<unsigned long long>(byte_offset), buffer_length);
++            }
++          }
++          const bool td_file = logical_name.size() == 11 &&
++                               logical_name.rfind("DATA", 0) == 0 &&
++                               logical_name.substr(7) == ".BIN";
++          const bool remapped = td_file && tek6_td_source_offset(
++              logical_name, byte_offset, buffer_length, &source_offset);
++          const bool idx_bridge = td_file &&
++                                  tek6_env_enabled("TEK6_RUNTIME_TD_IDX_BRIDGE");
++          const auto* host_entry =
++              dynamic_cast<const rex::filesystem::HostPathEntry*>(file_->entry());
++          std::filesystem::path decoded_path;
++          if (host_entry) {
++            decoded_path = host_entry->host_path();
++            decoded_path.replace_extension(".dec");
++          }
++          bool use_decoded_bank = false;
++          if (host_entry && idx_bridge && !remapped) {
++            uint64_t idx_source_offset = 0;
++            if (tek6_td_idx_source_offset(host_entry->host_path(), byte_offset,
++                                          buffer_length, tekken6_td_segments_,
++                                          &idx_source_offset)) {
++              source_offset = idx_source_offset;
++              use_decoded_bank = true;
++              static std::atomic<uint32_t> idx_log_count{0};
++              const uint32_t n = idx_log_count.fetch_add(1, std::memory_order_relaxed);
++              if (n < 512) {
++                std::fprintf(stderr,
++                             "[tekken6-rex] IDX TD map %s offset=0x%llx length=0x%x -> 0x%llx\n",
++                             logical_name.c_str(),
++                             static_cast<unsigned long long>(byte_offset), buffer_length,
++                             static_cast<unsigned long long>(source_offset));
++              }
++            }
++          }
++          if (host_entry && remapped && tek6_env_enabled("TEK6_RUNTIME_TD_BRIDGE")) {
++            use_decoded_bank = true;
++          }
++          // Some extracted banks retain the guest's logical offsets in their
++          // IDX records, while the raw .BIN is shorter than that logical
++          // address space.  Keep this diagnostic and opt-in: only fall back
++          // to the decoded companion when the raw request is provably beyond
++          // the raw file but fully contained by the decoded bank.
++          if (host_entry && !use_decoded_bank &&
++              tek6_env_enabled("TEK6_RUNTIME_TD_DECODED_FALLBACK")) {
++            const uint64_t raw_size = host_entry->size();
++            std::error_code decoded_ec;
++            const uint64_t decoded_size = std::filesystem::file_size(decoded_path, decoded_ec);
++            const uint64_t request_end = source_offset + uint64_t(buffer_length);
++            if (source_offset >= raw_size && request_end >= source_offset &&
++                !decoded_ec && request_end <= decoded_size) {
++              use_decoded_bank = true;
++              std::fprintf(stderr,
++                           "[tekken6-rex] decoded fallback %s offset=0x%llx length=0x%x raw=0x%llx decoded=0x%llx\n",
++                           logical_name.c_str(),
++                           static_cast<unsigned long long>(source_offset), buffer_length,
++                           static_cast<unsigned long long>(raw_size),
++                           static_cast<unsigned long long>(decoded_size));
++            }
++          }
++          if (use_decoded_bank) {
++              std::error_code ec;
++              if (std::filesystem::is_regular_file(decoded_path, ec)) {
++                std::ifstream decoded(decoded_path, std::ios::binary);
++                decoded.seekg(static_cast<std::streamoff>(source_offset), std::ios::beg);
++                decoded.read(reinterpret_cast<char*>(destination), buffer_length);
++                bytes_read = static_cast<size_t>(std::max<std::streamsize>(decoded.gcount(), 0));
++                result = decoded.bad() ? X_STATUS_UNSUCCESSFUL : X_STATUS_SUCCESS;
++                decoded_overlay = true;
++              }
++          }
++          if (!decoded_overlay) {
++            result = file_->ReadSync(std::span<uint8_t>(destination, buffer_length),
++                                     size_t(source_offset), &bytes_read);
++          }
++          if (std::getenv("TEKKEN6_TRACE_REX_FILE") != nullptr) {
++            static std::atomic<uint32_t> completion_trace_count{0};
++            const uint32_t n = completion_trace_count.fetch_add(1, std::memory_order_relaxed);
++            if (n < 512) {
++              std::fprintf(stderr,
++                           "[tekken6-rex-complete] #%u name=%s guest=0x%08x logical=0x%llx source=0x%llx length=0x%x bytes=0x%zx decoded=%s status=0x%08x\n",
++                           n, logical_name.c_str(), buffer_guest_address,
++                           static_cast<unsigned long long>(byte_offset),
++                           static_cast<unsigned long long>(source_offset), buffer_length,
++                           bytes_read, decoded_overlay ? "yes" : "no",
++                           static_cast<uint32_t>(result));
++            }
++          }
+           if (XSUCCEEDED(result)) {
+             if (buffer_physical_heap) {
+               buffer_physical_heap->TriggerCallbacks(
+@@ -201,6 +576,16 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
+ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, uint64_t byte_offset,
+                             uint32_t* out_bytes_read, uint32_t apc_context) {
+   std::lock_guard<std::mutex> lock(file_lock_);
++  if (std::getenv("TEKKEN6_TRACE_REX_FILE") != nullptr) {
++    static std::atomic<uint32_t> scatter_trace_count{0};
++    const uint32_t n = scatter_trace_count.fetch_add(1, std::memory_order_relaxed);
++    if (n < 512) {
++      std::fprintf(stderr,
++                   "[tekken6-rex-scatter] #%u name=%s path=%s segments=%08x length=0x%x offset=0x%llx\n",
++                   n, name().c_str(), path().c_str(), segments_guest_address, length,
++                   static_cast<unsigned long long>(byte_offset));
++    }
++  }
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   // segments points to an array of buffer pointers of type
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..cfad9cf 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <utility>
+ 
+@@ -27,6 +28,7 @@
+ #include <rex/stream.h>
+ #include <rex/system/function_dispatcher.h>
+ #include <rex/system/mmio_handler.h>
++#include <rex/system/thread_state.h>
+ #include <rex/system/xmemory.h>
+ #include <rex/thread.h>
+ 
+@@ -543,6 +545,21 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+   uint32_t virtual_address = HostToGuestVirtual(host_address);
+   BaseHeap* heap = LookupHeap(virtual_address);
+   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
++    if (virtual_address == 0x1C4Cu) {
++      static std::atomic<uint32_t> bad_1c4c_count{0};
++      const uint32_t n = bad_1c4c_count.fetch_add(1, std::memory_order_relaxed);
++      if (n < 32) {
++        auto* thread_state = rex::runtime::ThreadState::Get();
++        auto* context = thread_state ? thread_state->context() : nullptr;
++        REXSYS_ERROR(
++            "Tekken6 0x1C4C context #{} tid={:08X} last_indirect={:08X} "
++            "lr={:016X} r1={:08X} r3={:08X} r12={:08X}",
++            n, thread_state ? thread_state->thread_id() : 0xFFFFFFFFu,
++            context ? context->last_indirect_target : 0u, context ? context->lr : 0u,
++            context ? context->r1.u32 : 0u, context ? context->r3.u32 : 0u,
++            context ? context->r12.u32 : 0u);
++      }
++    }
+     REXSYS_ERROR(
+         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..8b10156 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -187,13 +187,23 @@ static uint8_t next_cpu = 0;
+ static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
+   // NOTE: proc_mask is logical processors, not physical processors or cores.
+   if (!proc_mask) {
++    // Keep the reference round-robin behavior available for titles whose
++    // guest workers use tight wait loops.  This is intentionally opt-in so
++    // Tekken can be compared against the parent-affinity experiment without
++    // throwing away the existing Xbox-accurate default.
++    if (std::getenv("TEK6_REX_ROUND_ROBIN_CPU") != nullptr) {
++      next_cpu = (next_cpu + 1) % 6;
++      return next_cpu;
++    }
++    // Xbox 360 leaves an unassigned child on its parent's hardware thread.
++    // Match Xenia/ReXGlue reference behavior rather than round-robin assigning
++    // every child, which can change guest synchronization ordering.
++    XThread* parent = current_xthread_tls_;
++    if (parent) {
++      return parent->active_cpu();
++    }
+     next_cpu = (next_cpu + 1) % 6;
+-    return next_cpu;  // is this reasonable?
+-    // TODO(Triang3l): Does the following apply here?
+-    // https://docs.microsoft.com/en-us/windows/win32/dxtecharts/coding-for-multiple-cores
+-    // "On Xbox 360, you must explicitly assign software threads to a particular
+-    //  hardware thread by using XSetThreadProcessor. Otherwise, all child
+-    //  threads will stay on the same hardware thread as the parent."
++    return next_cpu;
+   }
+   assert_false(proc_mask & 0xC0);
+ 
+@@ -465,6 +475,12 @@ X_STATUS XThread::Create() {
+     return X_STATUS_NO_MEMORY;
+   }
+ 
++  if (guest_thread_) {
++    REXSYS_TRACE("[Tekken6] guest thread create handle={:08X} start={:08X} context={:08X} flags={:08X}",
++                 handle(), creation_params_.start_address, creation_params_.start_context,
++                 creation_params_.creation_flags);
++  }
++
+   // Set the thread name based on host ID (for easier debugging).
+   if (thread_name_.empty()) {
+     set_name(fmt::format("XThread{:04X}", thread_->system_id()));
+@@ -597,6 +613,9 @@ void XThread::Execute() {
+     want_exit_code = true;
+   }
+ 
++  REXSYS_TRACE("[Tekken6] guest thread start handle={:08X} entry={:08X} arg={:08X}",
++               handle(), address, args.empty() ? 0u : static_cast<uint32_t>(args[0]));
++
+   // NOTE(tomc): JIT execution replaced with direct function calls
+   // In rexglue, guest code is compiled ahead of time and called directly.
+   // The start_address points to a 32bit guest address, for which the function
+@@ -648,6 +667,8 @@ void XThread::Execute() {
+   func(*ctx, base);
+ 
+   exit_code = static_cast<int>(ctx->r3.u32);
++  REXSYS_TRACE("[Tekken6] guest thread return handle={:08X} entry={:08X} r3={:08X}", handle(),
++               address, static_cast<uint32_t>(ctx->r3.u32));
+ 
+   // If we got here it means the execute completed without an exit being called.
+   // Treat the return code as an implicit exit code (if desired).
+diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
+index bf8252b..5684023 100644
+--- a/src/ui/d3d12/d3d12_provider.cpp
++++ b/src/ui/d3d12/d3d12_provider.cpp
+@@ -256,7 +256,7 @@ bool D3D12Provider::Initialize() {
+   while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+     DXGI_ADAPTER_DESC1 adapter_desc;
+     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+-      if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
++      if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+                                              nullptr))) {
+         if (REXCVAR_GET(d3d12_adapter) >= 0) {
+           if (adapter_index == REXCVAR_GET(d3d12_adapter)) {
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..4a4962d 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cmath>
+@@ -1529,6 +1530,9 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+ }
+ 
+ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
++  static std::atomic<uint64_t> paint_sequence{0};
++  const uint64_t current_paint_sequence =
++      paint_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+   // Begin the submission in place of the one not currently potentially used on
+   // the GPU.
+   uint64_t current_paint_submission_index =
+@@ -1631,13 +1635,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   GuestOutputProperties guest_output_properties;
+   GuestOutputPaintConfig guest_output_paint_config;
+   std::shared_ptr<GuestOutputImage> guest_output_image;
++  uint32_t guest_output_mailbox_index = UINT32_MAX;
++  uint64_t guest_output_version = UINT64_MAX;
+   {
+-    uint32_t guest_output_mailbox_index;
+     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
+     if (guest_output_mailbox_index != UINT32_MAX) {
+       assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
+       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
++      guest_output_version = guest_output_images_[guest_output_mailbox_index].version;
+     }
+     // Incremented the reference count of the guest output image - safe to leave
+     // the consumer critical section now as everything here either will be using
+@@ -2208,6 +2214,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+       }
+     }
+     if (submit_result != VK_SUCCESS) {
++      if (std::getenv("TEKKEN6_TRACE_SWAP") != nullptr) {
++        REXLOG_ERROR("T6 host present seq={} guest_output_version={} submit_result={}",
++                     current_paint_sequence, guest_output_version, int(submit_result));
++      }
+       REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
+       fence_acqusition.SubmissionFailedOrDropped();
+       ui_fence_acquisition.SubmissionFailedOrDropped();
+@@ -2242,6 +2252,29 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+   }
++  if (std::getenv("TEKKEN6_TRACE_SWAP") != nullptr) {
++    static std::atomic<int64_t> last_present_log_ms{0};
++    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                               std::chrono::steady_clock::now().time_since_epoch())
++                               .count();
++    int64_t previous_log_ms = last_present_log_ms.load(std::memory_order_relaxed);
++    if (current_paint_sequence <= 8 || present_result != VK_SUCCESS ||
++        now_ms - previous_log_ms >= 1000) {
++      if (current_paint_sequence <= 8 || present_result != VK_SUCCESS ||
++          last_present_log_ms.compare_exchange_strong(previous_log_ms, now_ms,
++                                                      std::memory_order_relaxed)) {
++        const VkExtent2D guest_extent = guest_output_image ? guest_output_image->extent()
++                                                            : VkExtent2D{0, 0};
++        REXLOG_INFO(
++            "T6 host present seq={} result={} swapchain_image={} swapchain={}x{} "
++            "guest_mailbox={} guest_version={} guest_extent={}x{} ui_thread={}",
++            current_paint_sequence, int(present_result), swapchain_image_index,
++            paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height,
++            guest_output_mailbox_index, guest_output_version, guest_extent.width,
++            guest_extent.height, execute_ui_drawers);
++      }
++    }
++  }
+   switch (present_result) {
+     case VK_SUCCESS:
+       return PaintResult::kPresented;
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 7bda2ad..305e7eb 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -18,6 +18,7 @@ add_executable(unit_tests
+     system/function_dispatcher_test.cpp
+     input/input_assignment_test.cpp
+     codegen/codegen_writer_test.cpp
++    codegen/function_scanner_test.cpp
+     codegen/output_partition_test.cpp
+     codegen/output_stamp_test.cpp
+ )
+diff --git a/tests/unit/codegen/function_scanner_test.cpp b/tests/unit/codegen/function_scanner_test.cpp
+new file mode 100644
+index 0000000..aaac8ae
+--- /dev/null
++++ b/tests/unit/codegen/function_scanner_test.cpp
+@@ -0,0 +1,121 @@
++/**
++ * @file        codegen/function_scanner_test.cpp
++ * @brief       Tests for conservative jump table detection
++ */
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <cstdint>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <vector>
++
++#include <rex/codegen/binary_view.h>
++#include <rex/codegen/code_region.h>
++#include <rex/codegen/config.h>
++#include <rex/codegen/function_scanner.h>
++#include <rex/codegen/test_support.h>
++
++#include "codegen/decoded_binary.h"
++
++namespace rex::codegen {
++namespace {
++
++void StoreBigEndianWord(std::vector<uint8_t>& data, uint32_t offset, uint32_t value) {
++  data[offset + 0] = static_cast<uint8_t>(value >> 24);
++  data[offset + 1] = static_cast<uint8_t>(value >> 16);
++  data[offset + 2] = static_cast<uint8_t>(value >> 8);
++  data[offset + 3] = static_cast<uint8_t>(value);
++}
++
++}  // namespace
++}  // namespace rex::codegen
++
++TEST_CASE("Jump table with backward function targets is rejected as incomplete",
++          "[codegen][function_scanner]") {
++  using namespace rex::codegen;
++
++  constexpr uint32_t kBase = 0;
++  constexpr uint32_t kFunctionStart = 0x40;
++  constexpr uint32_t kBranchAddress = 0x68;
++  constexpr uint32_t kTableAddress = 0xA0;
++  constexpr size_t kImageSize = 0xC0;
++
++  // The sequence loads a CTR target through an absolute indexed word table.
++  // Its first two entries target the current function; the third dispatches
++  // to an earlier function. The old scanner incorrectly returned the first
++  // two entries as a complete switch table.
++  std::vector<uint8_t> image(kImageSize);
++  for (uint32_t offset = 0; offset < kImageSize; offset += 4) {
++    StoreBigEndianWord(image, offset, 0x60000000);  // ori r0,r0,0 (nop)
++  }
++
++  constexpr uint32_t kInstructions[] = {
++      0x81430020,  // lwz    r10,32(r3)
++      0x3D200000,  // lis    r9,0
++      0x81640004,  // lwz    r11,4(r4)
++      0x390900A0,  // addi   r8,r9,0xA0
++      0x814A0000,  // lwz    r10,0(r10)
++      0x7C8A5A14,  // add    r4,r10,r11
++      0x7CEA582E,  // lwzx   r7,r10,r11
++      0x54E516BA,  // rlwinm r5,r7,2,26,29
++      0x7D65402E,  // lwzx   r11,r5,r8
++      0x7D6903A6,  // mtctr  r11
++      0x4E800420,  // bctr
++  };
++  for (size_t i = 0; i < std::size(kInstructions); ++i) {
++    StoreBigEndianWord(image, kFunctionStart + static_cast<uint32_t>(i * 4),
++                       kInstructions[i]);
++  }
++
++  StoreBigEndianWord(image, kTableAddress + 0, kFunctionStart);
++  StoreBigEndianWord(image, kTableAddress + 4, kFunctionStart);
++  StoreBigEndianWord(image, kTableAddress + 8, 0x10);
++
++  TestModule module;
++  module.Load(kBase, image.data(), image.size());
++  auto binary = BinaryView::fromModule(module);
++  DecodedBinary decoded(binary);
++  decoded.decode();
++
++  const CodeRegion region{kBase, static_cast<uint32_t>(image.size())};
++  const auto result = detectJumpTable(decoded, kBranchAddress, region, kFunctionStart,
++                                      static_cast<uint32_t>(image.size()));
++
++  CHECK_FALSE(result.has_value());
++}
++
++TEST_CASE("Manual jump table preserves a masked selector", "[codegen][config]") {
++  using namespace rex::codegen;
++
++  const auto configPath =
++      std::filesystem::temp_directory_path() / "rexglue_masked_switch_test.toml";
++  {
++    std::ofstream configFile(configPath, std::ios::binary);
++    REQUIRE(configFile.good());
++    configFile << R"(
++file_path = "fixture.xex"
++out_directory_path = "generated"
++
++[[switch_tables]]
++address = 0x8256D5E0
++register = 7
++selector_mask = 0xF
++labels = [0x8256D5B8, 0x8256D5B8, 0, 0]
++)";
++  }
++
++  RecompilerConfig config;
++  const bool loaded = config.Load(configPath.string());
++  std::error_code ec;
++  std::filesystem::remove(configPath, ec);
++
++  REQUIRE(loaded);
++  const auto it = config.switchTables.find(0x8256D5E0);
++  REQUIRE(it != config.switchTables.end());
++  CHECK(it->second.indexRegister == 7);
++  CHECK(it->second.selectorMask == 0xF);
++  REQUIRE(it->second.targets.size() == 4);
++  CHECK(it->second.targets[0] == 0x8256D5B8);
++}
+diff --git a/tests/unit/core/vfs_overwrite_test.cpp b/tests/unit/core/vfs_overwrite_test.cpp
+index 8f9f92f..c9158d6 100644
+--- a/tests/unit/core/vfs_overwrite_test.cpp
++++ b/tests/unit/core/vfs_overwrite_test.cpp
+@@ -122,3 +122,35 @@ TEST_CASE("VFS overwrite of a file held open by a reader keeps the file", "[file
+ 
+   CHECK(std::filesystem::exists(store.host_path()));
+ }
++
++TEST_CASE("VFS content alias survives stale mount teardown", "[filesystem][vfs]") {
++  static int counter = 0;
++  const auto root = std::filesystem::temp_directory_path() /
++                    ("rexglue_vfs_mount_pair_" + std::to_string(counter++));
++  const auto old_root = root / "old";
++  const auto new_root = root / "new";
++  std::filesystem::create_directories(old_root);
++  std::filesystem::create_directories(new_root);
++
++  VirtualFileSystem vfs;
++  constexpr std::string_view old_mount = "\\Device\\Content\\100\\";
++  constexpr std::string_view new_mount = "\\Device\\Content\\101\\";
++  auto old_device = std::make_unique<HostPathDevice>(old_mount, old_root, false, true);
++  REQUIRE(old_device->Initialize());
++  REQUIRE(vfs.RegisterDeviceAndSymbolicLink(std::move(old_device), "save:"));
++
++  REQUIRE(vfs.UnregisterDeviceAndSymbolicLink("save:", old_mount));
++  auto new_device = std::make_unique<HostPathDevice>(new_mount, new_root, false, true);
++  REQUIRE(new_device->Initialize());
++  REQUIRE(vfs.RegisterDeviceAndSymbolicLink(std::move(new_device), "SAVE:"));
++
++  // A delayed cleanup for the old package must not remove the alias now owned
++  // by the newly mounted package.
++  CHECK_FALSE(vfs.UnregisterDeviceAndSymbolicLink("save:", old_mount));
++  auto* entry = vfs.ResolvePath("save:\\");
++  REQUIRE(entry != nullptr);
++  CHECK(entry->device()->mount_path() == new_mount);
++
++  std::error_code ec;
++  std::filesystem::remove_all(root, ec);
++}

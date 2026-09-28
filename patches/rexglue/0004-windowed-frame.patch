@@ -1,0 +1,31 @@
+diff --git a/src/ui/window.cpp b/src/ui/window.cpp
+index b4e045f..d08746a 100644
+--- a/src/ui/window.cpp
++++ b/src/ui/window.cpp
+@@ -34,7 +34,7 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
+ // kHotReload (default): Window::SetFullscreen can be applied live, so the
+ // change callback registered in ReXApp::SetupPresentation keeps the window
+ // in sync whenever this cvar is changed at runtime.
+-REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode");
++REXCVAR_DEFINE_BOOL(fullscreen, false, "UI/Window", "Start the window in fullscreen mode");
+ 
+ REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
+                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..ea62719 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -174,6 +174,13 @@ bool WindowSDL::OpenImpl() {
+     // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
+     SDL_SetWindowFullscreen(sdl_window_, true);
+   }
++#if defined(_WIN32)
++  else {
++    // Explicitly retain the native title bar and resize frame for windowed
++    // Windows launches.
++    SDL_SetWindowBordered(sdl_window_, true);
++  }
++#endif
+ #if REX_PLATFORM_MAC
+   CFPreferencesSetAppValue(CFSTR("ApplePressAndHoldEnabled"), kCFBooleanFalse,
+                            kCFPreferencesCurrentApplication);
