@@ -78,7 +78,15 @@ def main() -> int:
         print("SDK has local changes; refusing to overwrite them.", file=sys.stderr)
         return 2
     git(sdk, "apply", "--check", str(patch))
-    git(sdk, "apply", "--intent-to-add", str(patch))
+    # Not `git apply --intent-to-add`: some git versions (Homebrew 2.50) write an
+    # index holding only the new files, which leaves every other SDK file
+    # staged as deleted. Mark the new files with add -N separately instead.
+    git(sdk, "apply", str(patch))
+    summary = git(sdk, "apply", "--summary", str(patch)).stdout
+    created = [line.split(" ", 4)[4] for line in summary.splitlines()
+               if line.startswith(" create mode ")]
+    if created:
+        git(sdk, "add", "-N", "--", *created)
     print("Applied the Tekken 6 SDK patch.")
     return 0
 

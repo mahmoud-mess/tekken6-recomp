@@ -1,3 +1,28 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf564234b3f010407f7ff0226d0e28baf2b3..c94504bd9392bfa5c4fa39f4b8c05d41f36d9cb2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -187,6 +187,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_pch.cmake)
+ 
+ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_version.cmake)
+ rex_resolve_version(REXGLUE_FULL_VERSION
++    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
+     FLOOR_MAJOR ${PROJECT_VERSION_MAJOR}
+     FLOOR_MINOR ${PROJECT_VERSION_MINOR})
+ 
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 41e6dce3254bae528ac80e52a6c799eb6c300373..dfdf7221125ce413371945ff25b4307c094c3459 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -12,7 +12,7 @@ function(_rexglue_stage_macos_vulkan_runtime target_name)
+     if(TARGET Vulkan::Loader AND TARGET MoltenVK::MoltenVK)
+         set(_rexglue_vulkan_loader Vulkan::Loader)
+         set(_rexglue_moltenvk MoltenVK::MoltenVK)
+-        set(_rexglue_moltenvk_icd "${REXGLUE_ROOT}/cmake/MoltenVK_icd.json")
++        set(_rexglue_moltenvk_icd "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MoltenVK_icd.json")
+     elseif(TARGET rex::vulkan-loader AND TARGET rex::moltenvk)
+         set(_rexglue_vulkan_loader rex::vulkan-loader)
+         set(_rexglue_moltenvk rex::moltenvk)
 diff --git a/include/rex/codegen/config.h b/include/rex/codegen/config.h
 index 8200139a62d727f28389cfd0566d5fccfb57d8df..e94ef3a2920c2f8013d029d171e3db695955a836 100644
 --- a/include/rex/codegen/config.h
@@ -428,7 +453,7 @@ index d26cd4fbafbe7d19ba52391afd913f402220f834..2bd1dacbc665af1fa9e711ddd9f9bf4c
      assert_true(load_shader_index < kLoadShaderCount);
      return load_shader_info_[load_shader_index];
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index 4d85a2b5c7ee5f63f6c521facac8a9123c01e0fc..f27bfccb727409d3db37d98022e8f2cb90e23080 100644
+index 4d85a2b5c7ee5f63f6c521facac8a9123c01e0fc..4b26da1e5337036fe78e3da214cfebd8b968c7fa 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
 @@ -95,6 +95,12 @@ class SharedMemory {
@@ -444,6 +469,17 @@ index 4d85a2b5c7ee5f63f6c521facac8a9123c01e0fc..f27bfccb727409d3db37d98022e8f2cb
   protected:
    SharedMemory(memory::Memory& memory);
    // Call in implementation-specific initialization.
+@@ -140,6 +146,10 @@ class SharedMemory {
+   virtual bool UploadRanges(
+       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+ 
++  // Every range requested since the implementation last took them (the ranges
++  // the next draw reads), in bytes.
++  std::vector<std::pair<uint32_t, uint32_t>> requested_ranges_;
++
+  private:
+   memory::Memory& memory_;
+ 
 diff --git a/include/rex/graphics/util/draw.h b/include/rex/graphics/util/draw.h
 index 3da182d480afc78df231f643238b9061a10f1e6a..89f53f0139be76b37d930eb68aa2e30cff2ba805 100644
 --- a/include/rex/graphics/util/draw.h
@@ -461,10 +497,10 @@ index 3da182d480afc78df231f643238b9061a10f1e6a..89f53f0139be76b37d930eb68aa2e30c
    // copy_dest_extent_length may be zero if something is wrong with the
    // destination, in this case, clearing may still be done, but copying must be
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff481c12369287f7c8096cba8daf15b50c68c..8247bda6ef547f4b2191cdebcf1346132312e864 100644
+index 696ff481c12369287f7c8096cba8daf15b50c68c..3c5964fed7f3022fb4dd8cdfc28ce69f241900c6 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -788,6 +788,13 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -788,11 +788,25 @@ class VulkanCommandProcessor : public CommandProcessor {
    std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
    std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
  
@@ -478,6 +514,118 @@ index 696ff481c12369287f7c8096cba8daf15b50c68c..8247bda6ef547f4b2191cdebcf134613
    // Cache render pass currently started in the command buffer with the
    // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
    // but in_render_pass_ is true.
+   VkRenderPass current_render_pass_;
+   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
++  // With dynamic rendering, a transfer pass and a draw pass into the same
++  // framebuffer differ only in their attachments (the transfer binds just the
++  // destination, through an ownership transfer view whose format may be an
++  // integer one), so the framebuffer alone can't tell whether the open pass is
++  // the one needed. The transfer destination view, VK_NULL_HANDLE for a draw
++  // pass.
++  VkImageView current_transfer_dest_view_ = VK_NULL_HANDLE;
+   bool in_render_pass_ = false;
+ 
+   // Currently bound graphics pipeline, either from the pipeline cache (with
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a8485638bae58b43636f0690e56625ef71b05..e606ea3eb7f0438cdc645f608c165c18fb857953 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -31,6 +31,15 @@ class DeferredCommandBuffer {
+   void Reset();
+   void Execute(VkCommandBuffer command_buffer);
+ 
++  // Nonzero while a render pass is open: identifies that pass.
++  uint64_t open_pass_serial() const { return pass_open_ ? pass_serial_ : 0; }
++  // Records a buffer copy that executes before the open render pass begins,
++  // with barriers ordering it after everything earlier in the stream and before
++  // everything in and after the pass. Only valid while a pass is open, and only
++  // for data that no draw already recorded in the pass reads.
++  void HoistCopyBufferBeforeOpenPass(VkBuffer src_buffer, VkBuffer dst_buffer,
++                                     uint32_t region_count, const VkBufferCopy* regions);
++
+   // render_pass_begin->pNext of all barriers must be null.
+   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
+                             VkSubpassContents contents) {
+@@ -43,6 +52,7 @@ class DeferredCommandBuffer {
+       clear_values_offset = arguments_size;
+       arguments_size += sizeof(VkClearValue) * clear_value_count;
+     }
++    WriteUploadSlot();
+     uint8_t* args_ptr =
+         reinterpret_cast<uint8_t*>(WriteCommand(Command::kVkBeginRenderPass, arguments_size));
+     auto& args = *reinterpret_cast<ArgsVkBeginRenderPass*>(args_ptr);
+@@ -259,11 +269,17 @@ class DeferredCommandBuffer {
+     args.query = query;
+   }
+ 
+-  void CmdVkEndRenderPass() { WriteCommand(Command::kVkEndRenderPass, 0); }
++  void CmdVkEndRenderPass() {
++    pass_open_ = false;
++    WriteCommand(Command::kVkEndRenderPass, 0);
++  }
+ 
+   // Dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3).
+   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
+-  void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
++  void CmdVkEndRendering() {
++    pass_open_ = false;
++    WriteCommand(Command::kVkEndRendering, 0);
++  }
+ 
+   void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count) {
+     auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(
+@@ -381,6 +397,7 @@ class DeferredCommandBuffer {
+     kVkSetStencilReference,
+     kVkSetStencilWriteMask,
+     kVkSetViewport,
++    kUploadSlot,
+   };
+ 
+   struct CommandHeader {
+@@ -570,6 +587,10 @@ class DeferredCommandBuffer {
+     uint32_t mask_reference;
+   };
+ 
++  struct ArgsUploadSlot {
++    uint32_t slot;
++  };
++
+   struct ArgsVkSetViewport {
+     uint32_t first_viewport;
+     uint32_t viewport_count;
+@@ -579,10 +600,32 @@ class DeferredCommandBuffer {
+ 
+   void* WriteCommand(Command command, size_t arguments_size_bytes);
+ 
++  // Every render pass is preceded by an upload slot: copies that would
++  // otherwise end the pass are recorded there instead (see
++  // HoistCopyBufferBeforeOpenPass). Breaking a pass costs a full store and
++  // reload of its attachments on a tile-based GPU.
++  void WriteUploadSlot();
++  void ExecuteUploadSlot(VkCommandBuffer command_buffer, uint32_t slot) const;
++
+   const VulkanCommandProcessor& command_processor_;
+ 
+   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
+   std::vector<uintmax_t> command_stream_;
++
++  bool pass_open_ = false;
++  uint64_t pass_serial_ = 0;
++
++  struct HoistedCopy {
++    VkBuffer src_buffer;
++    VkBuffer dst_buffer;
++    uint32_t first_region;
++    uint32_t region_count;
++  };
++  struct UploadSlot {
++    std::vector<HoistedCopy> copies;
++  };
++  std::vector<UploadSlot> upload_slots_;
++  std::vector<VkBufferCopy> hoisted_regions_;
+ };
+ 
+ }  // namespace rex::graphics::vulkan
 diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
 index 7b938b97961d607a74a93661adad271d0eaca632..f27c6ed9077931ad18d3f3ca53df673f318d7404 100644
 --- a/include/rex/graphics/vulkan/pipeline_cache.h
@@ -499,6 +647,36 @@ index 7b938b97961d607a74a93661adad271d0eaca632..f27c6ed9077931ad18d3f3ca53df673f
    VulkanCommandProcessor& command_processor_;
    const RegisterFile& register_file_;
    VulkanRenderTargetCache& render_target_cache_;
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index 104bdad34542f8d60efff69e0f80ced2ff7ef10d..0485ee4597996fc3c3128b182c74795abd334ad9 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -49,6 +49,11 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   VkBuffer buffer() const { return buffer_; }
+ 
++  // Call right before recording a draw: the ranges requested for it are now
++  // read inside the open render pass, so uploads to them can no longer be
++  // moved ahead of that pass.
++  void NoteDrawReadsInOpenPass();
++
+  protected:
+   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+                                         uint32_t length_allocations) override;
+@@ -72,6 +77,13 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
+   std::vector<VkBufferCopy> upload_regions_;
++
++  bool OpenPassReadsAnyOf(
++      const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) const;
++
++  // Byte ranges read by the draws already recorded in the open render pass.
++  uint64_t open_pass_reads_serial_ = 0;
++  std::vector<std::pair<uint32_t, uint32_t>> open_pass_reads_;
+ };
+ 
+ }  // namespace rex::graphics::vulkan
 diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
 index 0ede54262059bff41c8c1f5047602fe406d68e03..b16b9949428b14761cd356494115ec1772c0367a 100644
 --- a/include/rex/ppc/context.h
@@ -583,6 +761,20 @@ index d54df8669311a6f6518eab2477bf166008a25775..b8ba285433444f51aeb00097f50bcd86
    // Guest GPU services reached from the xboxkrnl Vd* exports.
    virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
      (void)callback;
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index 9b9cf9eb98537111d3a1034b47f4f18ecffaa2f8..23909788f08b1931e6e15787e248086579fdc642 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -203,6 +203,9 @@ class KernelState {
+ 
+   // Access must be guarded by the global critical region.
+   util::ObjectTable* object_table() { return &object_table_; }
++  // Hang diagnostics: print every waitable object's host state and each
++  // guest thread's current wait to stderr and the log.
++  void DumpKernelObjects();
+ 
+   uint32_t process_type() const;
+   void set_process_type(uint32_t value);
 diff --git a/include/rex/system/xfile.h b/include/rex/system/xfile.h
 index 6063f3cc5d6c2f3b097a27c719dd34235a6d1cc4..b592a384d17bc334745fcbfede942c79ec0fe82c 100644
 --- a/include/rex/system/xfile.h
@@ -624,7 +816,7 @@ index 6063f3cc5d6c2f3b097a27c719dd34235a6d1cc4..b592a384d17bc334745fcbfede942c79
  
    uint64_t position_ = 0;
 diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
-index 0a43f07e52e94b957e74ab29dd31c368354fb035..6de6255eaf010b67efcc39ad7e0575c344094efb 100644
+index 0a43f07e52e94b957e74ab29dd31c368354fb035..ab988a343dcd0c259da89ee892049db4b1ea4f2f 100644
 --- a/include/rex/system/xobject.h
 +++ b/include/rex/system/xobject.h
 @@ -181,6 +181,7 @@ class XObject {
@@ -635,6 +827,61 @@ index 0a43f07e52e94b957e74ab29dd31c368354fb035..6de6255eaf010b67efcc39ad7e0575c3
    static object_ref<XObject> Restore(KernelState* kernel_state, Type type,
                                       stream::ByteStream* stream);
  
+@@ -209,6 +210,14 @@ class XObject {
+ 
+   // Called on successful wait.
+   virtual void WaitCallback() {}
++ public:
++  // Hang diagnostics: host state of the wait handle, empty if not waitable.
++  std::string DebugWaitState() {
++    auto* wait_handle = GetWaitHandle();
++    return wait_handle ? wait_handle->debug_state() : std::string();
++  }
++
++ protected:
+   virtual rex::thread::WaitHandle* GetWaitHandle() { return nullptr; }
+ 
+   // Creates the kernel object for guest code to use. Typically not needed.
+diff --git a/include/rex/system/xthread.h b/include/rex/system/xthread.h
+index a72911e135affe984e957bcc9c7fa0b4b88efd13..21946aab0b2c923069d4d322b429a6a2f5f5210c 100644
+--- a/include/rex/system/xthread.h
++++ b/include/rex/system/xthread.h
+@@ -333,6 +333,13 @@ class XThread : public XObject {
+   bool is_running() const { return running_; }
+ 
+   uint32_t thread_id() const { return thread_id_; }
++  // Handles this thread is currently blocked on (0 = none); hang diagnostics.
++  void SetDebugWait(uint32_t a, uint32_t b = 0, uint32_t c = 0) {
++    debug_wait_[0].store(a, std::memory_order_relaxed);
++    debug_wait_[1].store(b, std::memory_order_relaxed);
++    debug_wait_[2].store(c, std::memory_order_relaxed);
++  }
++  uint32_t debug_wait(size_t i) const { return debug_wait_[i].load(std::memory_order_relaxed); }
+   uint32_t last_error();
+   void set_last_error(uint32_t error_code);
+   void set_name(const std::string_view name);
+@@ -421,6 +428,7 @@ class XThread : public XObject {
+   // Atomic: written by the thread itself in Exit/Terminate, read cross-thread by
+   // KernelState::TerminateTitle's cooperative drain.
+   std::atomic<bool> running_{false};
++  std::atomic<uint32_t> debug_wait_[3]{};
+ 
+   std::string thread_name_;
+   std::unique_ptr<runtime::ThreadState> thread_state_;
+diff --git a/include/rex/thread.h b/include/rex/thread.h
+index 30b207ddefd214155b2e610cbeadf3b4e232ab6d..5a45eb9b0a39aaa9e9cd53bcf671552d6c4a67f8 100644
+--- a/include/rex/thread.h
++++ b/include/rex/thread.h
+@@ -202,6 +202,9 @@ class WaitHandle {
+   // This value is platform specific.
+   virtual void* native_handle() const = 0;
+ 
++  // Human-readable host state of the object, for hang diagnostics.
++  virtual std::string debug_state() const { return std::string(); }
++
+  protected:
+   WaitHandle() = default;
+ };
 diff --git a/include/rex/ui/d3d12/d3d12_api.h b/include/rex/ui/d3d12/d3d12_api.h
 index d0e7252875396b0330866c36ae3f3af7f21ebcad..d558846d296deddd77396845039f94a32229aafa 100644
 --- a/include/rex/ui/d3d12/d3d12_api.h
@@ -655,6 +902,18 @@ index d0e7252875396b0330866c36ae3f3af7f21ebcad..d558846d296deddd77396845039f94a3
 +#endif
 +
  // clang-format on
+diff --git a/include/rex/ui/flags.h b/include/rex/ui/flags.h
+index fa2ef60581b70f8648a5f5bd0aa09c03e5842aa3..38debed0dd623dffa9ac02e1fcccbf5a1ac6dcde 100644
+--- a/include/rex/ui/flags.h
++++ b/include/rex/ui/flags.h
+@@ -28,6 +28,7 @@ REXCVAR_DECLARE(bool, present_allow_overscan_cutoff);
+ REXCVAR_DECLARE(bool, host_present_from_non_ui_thread);
+ REXCVAR_DECLARE(int32_t, window_width);
+ REXCVAR_DECLARE(int32_t, window_height);
++REXCVAR_DECLARE(bool, window_high_pixel_density);
+ REXCVAR_DECLARE(bool, fullscreen);
+ REXCVAR_DECLARE(int32_t, monitor);
+ REXCVAR_DECLARE(std::string, video_driver);
 diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
 index aa55a4a284d966b2de2251a2c7aa595c741ca046..54a59f7846de997885a1ff249444a3955922b262 100644
 --- a/include/rex/ui/vulkan/functions/device_1_0.inc
@@ -977,10 +1236,16 @@ index 1c735482a227d52375793f3dac1f9c04d1062b53..d0876f8e61f769282c2374290cf84b34
    if (result.blocks.empty()) {
      REXCODEGEN_WARN("Analyze: no blocks found for function 0x{:08X}", funcAddr);
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..40dd3ad743b96714424ed963ae2be6ad50c90864 100644
+index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf37d1c6503 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
-@@ -19,8 +19,11 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -14,13 +14,17 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <signal.h>
+ 
+ #include <atomic>
++#include <fmt/format.h>
+ #include <array>
+ #include <cerrno>
  #include <cstddef>
  #include <ctime>
  #include <deque>
@@ -992,7 +1257,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..40dd3ad743b96714424ed963ae2be6ad
  
  #include <pthread.h>
  #include <semaphore.h>
-@@ -64,6 +67,14 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -64,6 +68,14 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  
  namespace rex::thread {
  
@@ -1007,7 +1272,104 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..40dd3ad743b96714424ed963ae2be6ad
  #if REX_PLATFORM_ANDROID
  // May be null if no dynamically loaded functions are required.
  static void* android_libc_;
-@@ -367,7 +378,12 @@ class PosixConditionBase {
+@@ -267,6 +279,8 @@ static sem_t* RexCreateAnonymousSemaphore() {
+ }
+ #endif  // __APPLE__
+ 
++constexpr auto kAlertablePollSlice = std::chrono::milliseconds(1);
++
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+@@ -288,8 +302,22 @@ class PosixConditionBase {
+   virtual bool Signal() = 0;
+ 
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+-    bool executed;
+-    auto predicate = [this] { return this->signaled(); };
++    return WaitUntil(nullptr, DeadlineFromTimeout(timeout), nullptr);
++  }
++
++  // Waits for this object, optionally releasing `to_signal` first and
++  // optionally returning kUserCallback as soon as `alert_flag` is set.
++  //
++  // The signal happens only after this thread holds the wait lock, so another
++  // thread that is unblocked by it cannot Signal() this object and then steal
++  // that signal back with its own wait before this thread is registered: that
++  // is what SignalObjectAndWait guarantees on the Xbox, and guest code relies
++  // on it for its mutex-protected flag/event handshakes. For the same reason an
++  // alertable wait polls `alert_flag` with the lock held instead of leaving and
++  // re-entering the wait every poll slice.
++  WaitResult WaitUntil(PosixConditionBase* to_signal,
++                       std::chrono::steady_clock::time_point deadline,
++                       const std::atomic<bool>* alert_flag) {
+ #if REX_PLATFORM_LINUX
+     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+     int lock_result = pthread_mutex_lock(native_mutex);
+@@ -302,22 +330,50 @@ class PosixConditionBase {
+ #else
+     std::unique_lock<std::mutex> lock(mutex_);
+ #endif
+-    if (predicate()) {
+-      executed = true;
+-    } else {
+-      if (timeout == std::chrono::milliseconds::max()) {
+-        cond_.wait(lock, predicate);
+-        executed = true;  // Did not time out;
++    if (to_signal && to_signal != this && !to_signal->Signal()) {
++      return WaitResult::kFailed;
++    }
++    const bool infinite = deadline == std::chrono::steady_clock::time_point::max();
++    OnWaitEnter();
++    while (true) {
++      if (signaled()) {
++        post_execution();
++        OnWaitExit(true);
++        return WaitResult::kSuccess;
++      }
++      if (alert_flag && alert_flag->load(std::memory_order_acquire)) {
++        OnWaitExit(false);
++        return WaitResult::kUserCallback;
++      }
++      if (alert_flag) {
++        auto slice = kAlertablePollSlice;
++        if (!infinite) {
++          auto now = std::chrono::steady_clock::now();
++          if (now >= deadline) {
++            OnWaitExit(false);
++            return WaitResult::kTimeout;
++          }
++          slice = std::min(slice, std::chrono::duration_cast<std::chrono::milliseconds>(
++                                      deadline - now) + std::chrono::milliseconds(1));
++        }
++        cond_.wait_for(lock, slice);
++      } else if (infinite) {
++        cond_.wait(lock);
+       } else {
+-        executed = cond_.wait_for(lock, timeout, predicate);
++        if (cond_.wait_until(lock, deadline) == std::cv_status::timeout && !signaled()) {
++          OnWaitExit(false);
++          return WaitResult::kTimeout;
++        }
+       }
+     }
+-    if (executed) {
+-      post_execution();
+-      return WaitResult::kSuccess;
+-    } else {
+-      return WaitResult::kTimeout;
++  }
++
++  static std::chrono::steady_clock::time_point DeadlineFromTimeout(
++      std::chrono::milliseconds timeout) {
++    if (timeout == std::chrono::milliseconds::max()) {
++      return std::chrono::steady_clock::time_point::max();
+     }
++    return std::chrono::steady_clock::now() + timeout;
+   }
+ 
+   static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
+@@ -367,7 +423,12 @@ class PosixConditionBase {
  
        if (!all_locked) {
          locks.clear();
@@ -1021,23 +1383,127 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..40dd3ad743b96714424ed963ae2be6ad
          continue;
        }
  
-@@ -449,7 +465,14 @@ class PosixCondition<Event> : public PosixConditionBase {
-   bool Signal() override {
-     auto lock = std::unique_lock<std::mutex>(mutex_);
-     signal_ = true;
--    cond_.notify_all();
-+    // Windows auto-reset events release one waiter. Waking every waiter here
-+    // lets competing guest SignalAndWait loops race to consume the same signal
-+    // and can starve the queue worker. Manual-reset events still wake all.
-+    if (manual_reset_ || std::getenv("TEKKEN6_LEGACY_EVENT_WAIT") != nullptr) {
-+      cond_.notify_all();
-+    } else {
-+      cond_.notify_one();
-+    }
-     return true;
+@@ -425,9 +486,16 @@ class PosixConditionBase {
+     return const_cast<std::condition_variable&>(cond_).native_handle();
    }
  
-@@ -487,6 +510,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
++  // Host state for hang diagnostics; never blocks on the object's mutex.
++  virtual std::string DebugState() const { return std::string(); }
++
+  protected:
+   inline virtual bool signaled() const = 0;
+   inline virtual void post_execution() = 0;
++  // Called with mutex_ held when a thread enters/leaves a blocking wait on
++  // this object through WaitUntil. `consumed` is true when the wait succeeded.
++  virtual void OnWaitEnter() {}
++  virtual void OnWaitExit(bool consumed) {}
+   std::condition_variable cond_;
+   std::mutex mutex_;
+ };
+@@ -448,7 +516,31 @@ class PosixCondition<Event> : public PosixConditionBase {
+ 
+   bool Signal() override {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+-    signal_ = true;
++    if (manual_reset_) {
++      // On Windows and the 360 kernel, SetEvent satisfies every wait that is
++      // in progress at that moment; a ResetEvent right after (the Set/Reset
++      // "pulse" the game's condition variables rely on) only affects threads
++      // that start waiting later. Remember the ticket boundary so the threads
++      // already waiting still return success after the reset.
++      signal_ = true;
++      release_boundary_ = next_ticket_;
++      cond_.notify_all();
++      return true;
++    }
++    // Auto-reset: on Windows, SetEvent with a waiting thread hands the signal
++    // to that thread inside the kernel, so a thread that starts waiting
++    // afterwards can never take it. Emulate that by reserving one release for
++    // the threads already waiting (tickets below the boundary); only when no
++    // such thread exists does the event stay plainly signaled.
++    if (waiters_ > release_count_) {
++      if (release_count_ == 0) {
++        release_boundary_ = next_ticket_;
++        eligible_waiters_ = waiters_;
++      }
++      ++release_count_;
++    } else {
++      signal_ = true;
++    }
+     cond_.notify_all();
+     return true;
+   }
+@@ -458,17 +550,67 @@ class PosixCondition<Event> : public PosixConditionBase {
+     signal_ = false;
+   }
+ 
++  std::string DebugState() const override {
++    std::unique_lock<std::mutex> lock(const_cast<std::mutex&>(mutex_), std::try_to_lock);
++    return fmt::format("event {} signaled={} waiters={} releases={} eligible={}{}",
++                       manual_reset_ ? "manual" : "auto", signal_, waiters_, release_count_,
++                       eligible_waiters_, lock.owns_lock() ? "" : " (mutex busy)");
++  }
++
+  private:
+-  inline bool signaled() const override { return signal_; }
++  bool eligible() const {
++    return !manual_reset_ && release_count_ > 0 && tls_wait_object_ == this &&
++           tls_ticket_ < release_boundary_;
++  }
++  bool released_by_earlier_set() const {
++    return manual_reset_ && tls_wait_object_ == this && tls_ticket_ < release_boundary_;
++  }
++  inline bool signaled() const override {
++    return signal_ || eligible() || released_by_earlier_set();
++  }
+   inline void post_execution() override {
+-    if (!manual_reset_) {
++    if (manual_reset_) {
++      return;
++    }
++    if (eligible()) {
++      --release_count_;
++    } else {
+       signal_ = false;
+     }
+   }
++  void OnWaitEnter() override {
++    tls_wait_object_ = this;
++    tls_ticket_ = next_ticket_++;
++    ++waiters_;
++  }
++  void OnWaitExit(bool consumed) override {
++    const bool was_eligible = !manual_reset_ && tls_ticket_ < release_boundary_;
++    --waiters_;
++    tls_wait_object_ = nullptr;
++    if (was_eligible && eligible_waiters_ > 0) {
++      --eligible_waiters_;
++    }
++    // Reservations nobody eligible can take fold back into a plain signal.
++    if (release_count_ > eligible_waiters_) {
++      signal_ = true;
++      release_count_ = eligible_waiters_;
++    }
++    (void)consumed;
++  }
+   bool signal_;
+   const bool manual_reset_;
++  uint32_t waiters_ = 0;
++  uint32_t release_count_ = 0;
++  uint32_t eligible_waiters_ = 0;
++  uint64_t next_ticket_ = 0;
++  uint64_t release_boundary_ = 0;
++  static thread_local const PosixCondition<Event>* tls_wait_object_;
++  static thread_local uint64_t tls_ticket_;
+ };
+ 
++thread_local const PosixCondition<Event>* PosixCondition<Event>::tls_wait_object_ = nullptr;
++thread_local uint64_t PosixCondition<Event>::tls_ticket_ = 0;
++
+ template <>
+ class PosixCondition<Semaphore> : public PosixConditionBase {
+  public:
+@@ -487,9 +629,16 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
      }
      count_ += release_count;
      cond_.notify_all();
@@ -1045,6 +1511,139 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..40dd3ad743b96714424ed963ae2be6ad
      return true;
    }
  
++  std::string DebugState() const override {
++    std::unique_lock<std::mutex> lock(const_cast<std::mutex&>(mutex_), std::try_to_lock);
++    return fmt::format("semaphore count={} max={}{}", count_, maximum_count_,
++                       lock.owns_lock() ? "" : " (mutex busy)");
++  }
++
+  private:
+   inline bool signaled() const override { return count_ > 0; }
+   inline void post_execution() override {
+@@ -534,9 +683,18 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+   inline void post_execution() override {
+     count_++;
+     owner_ = std::this_thread::get_id();
++    owner_system_id_ = current_thread_system_id();
+   }
+   uint32_t count_;
+   std::thread::id owner_;
++  uint32_t owner_system_id_ = 0;
++
++ public:
++  std::string DebugState() const override {
++    std::unique_lock<std::mutex> lock(const_cast<std::mutex&>(mutex_), std::try_to_lock);
++    return fmt::format("mutant count={} owner_thread={}{}", count_,
++                       count_ ? owner_system_id_ : 0, lock.owns_lock() ? "" : " (mutex busy)");
++  }
+ };
+ 
+ template <>
+@@ -1043,6 +1201,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   mutable std::condition_variable state_signal_;
+   std::deque<std::function<void()>> user_callbacks_;
+   std::atomic<bool> has_pending_user_callbacks_{false};
++
++ public:
++  const std::atomic<bool>* pending_user_callbacks_flag() const {
++    return &has_pending_user_callbacks_;
++  }
++
++ private:
+ #if REX_PLATFORM_ANDROID
+   // Name accessible via name() on Android before API 26 which added
+   // pthread_getname_np.
+@@ -1068,9 +1233,15 @@ bool DispatchCurrentThreadUserCallback() {
+   return current_thread_condition_ && current_thread_condition_->DispatchQueuedUserCallbacks();
+ }
+ 
+-namespace {
++const std::atomic<bool>* CurrentThreadPendingUserCallbacksFlag() {
++  if (!current_thread_condition_) {
++    Thread::GetCurrentThread();
++  }
++  return current_thread_condition_ ? current_thread_condition_->pending_user_callbacks_flag()
++                                   : nullptr;
++}
+ 
+-constexpr auto kAlertablePollSlice = std::chrono::milliseconds(1);
++namespace {
+ 
+ class ScopedAlertableState {
+  public:
+@@ -1130,6 +1301,7 @@ class PosixConditionHandle : public T, public PosixWaitHandle {
+ 
+   PosixCondition<T>& condition() override { return handle_; }
+   void* native_handle() const override { return handle_.native_handle(); }
++  std::string debug_state() const override { return handle_.DebugState(); }
+ 
+  protected:
+   PosixCondition<T> handle_;
+@@ -1165,6 +1337,7 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
+ 
+   ScopedAlertableState alertable_state_guard(true);
+   auto deadline = ComputeAlertableDeadline(timeout);
++  const std::atomic<bool>* alert_flag = CurrentThreadPendingUserCallbacksFlag();
+ 
+   while (true) {
+     if (DispatchCurrentThreadUserCallback()) {
+@@ -1173,10 +1346,12 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
+     if (HasAlertableTimeoutElapsed(deadline)) {
+       return WaitResult::kTimeout;
+     }
+-    auto result = posix_wait_handle->condition().Wait(ComputeAlertableWaitTimeout(deadline));
+-    if (result != WaitResult::kTimeout) {
++    auto result = posix_wait_handle->condition().WaitUntil(nullptr, deadline, alert_flag);
++    if (result != WaitResult::kUserCallback) {
+       return result;
+     }
++    // The flag was set: loop to dispatch the callback (or re-wait if it was
++    // already drained by someone else).
+   }
+ }
+ 
+@@ -1188,25 +1363,34 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
+   if (posix_wait_handle_to_signal == nullptr || posix_wait_handle_to_wait_on == nullptr) {
+     return WaitResult::kFailed;
+   }
+-  if (!posix_wait_handle_to_signal->condition().Signal()) {
+-    return WaitResult::kFailed;
+-  }
++  auto& to_signal = posix_wait_handle_to_signal->condition();
++  auto& to_wait_on = posix_wait_handle_to_wait_on->condition();
++  auto deadline = ComputeAlertableDeadline(timeout);
+ 
+   if (!is_alertable) {
+-    return posix_wait_handle_to_wait_on->condition().Wait(timeout);
++    return to_wait_on.WaitUntil(&to_signal, deadline, nullptr);
+   }
+ 
+   ScopedAlertableState alertable_state_guard(true);
+-  auto deadline = ComputeAlertableDeadline(timeout);
++  const std::atomic<bool>* alert_flag = CurrentThreadPendingUserCallbacksFlag();
++  // Signal exactly once, atomically with the first wait registration.
++  PosixConditionBase* pending_signal = &to_signal;
+   while (true) {
+     if (DispatchCurrentThreadUserCallback()) {
++      if (pending_signal) {
++        pending_signal->Signal();
++      }
+       return WaitResult::kUserCallback;
+     }
+     if (HasAlertableTimeoutElapsed(deadline)) {
++      if (pending_signal) {
++        pending_signal->Signal();
++      }
+       return WaitResult::kTimeout;
+     }
+-    result = posix_wait_handle_to_wait_on->condition().Wait(ComputeAlertableWaitTimeout(deadline));
+-    if (result != WaitResult::kTimeout) {
++    result = to_wait_on.WaitUntil(pending_signal, deadline, alert_flag);
++    pending_signal = nullptr;
++    if (result != WaitResult::kUserCallback) {
+       return result;
+     }
+   }
 diff --git a/src/filesystem/devices/host_path_entry.cpp b/src/filesystem/devices/host_path_entry.cpp
 index 66504008886d542e11e056656db5b93ac6880bbf..2775de0452350cc0989be5fac6de0227fa8d7bab 100644
 --- a/src/filesystem/devices/host_path_entry.cpp
@@ -2059,6 +2658,80 @@ index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..8441a24f3f7a5ed3d9b79d898a2ead9a
  void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_responsible) {
    // TODO(Triang3l): Somehow gain exclusive ownership of the Provider (may be
    // used by the command processor, the presenter, and possibly anything else,
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 953c5fd4cff4f9b4bfac546fdbd06d03cd0994f4..3f8ca1b0aa853d353c675844bb5e1fb511cdb5e9 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -10,7 +10,9 @@
+  */
+ 
+ #include <algorithm>
++#include <string>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <iterator>
+ #include <tuple>
+@@ -43,6 +45,18 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
+ 
+ namespace rex::graphics {
+ 
++namespace {
++template <typename Key>
++std::string DescribeRenderTargetKey(Key key) {
++  if (key.IsEmpty()) {
++    return "none";
++  }
++  return fmt::format("{}{}@{}p{}x{}", key.is_depth ? "d" : "c", uint32_t(key.resource_format),
++                     uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp),
++                     1u << uint32_t(key.msaa_samples));
++}
++}  // namespace
++
+ void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
+                                               uint32_t write_mask, float& clamp_rgb_low,
+                                               float& clamp_alpha_low, float& clamp_rgb_high,
+@@ -683,6 +697,20 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   // draw with whatever contents currently are in the render target in this
+   // case).
+ 
++  {
++    std::string bound;
++    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++      const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
++      bound += fmt::format(" rt{}={}+{}", rt_base_index.second,
++                           DescribeRenderTargetKey(rt_keys[rt_base_index.second]),
++                           rt_lengths_tiles[i]);
++    }
++    static std::string last_bound;
++    if (bound != last_bound) {
++      last_bound = bound;
++      REXGPU_DEBUG("bind:{}", bound);
++    }
++  }
+   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+     uint32_t rt_bit_index = rt_base_index.second;
+@@ -1237,6 +1265,7 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey des
+   return false;
+ }
+ 
++
+ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
+                                         uint32_t length_tiles,
+                                         std::vector<Transfer>* transfers_append_out,
+@@ -1336,6 +1365,11 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+                       transfer_host_depth_source_rt_it != render_targets_.end()
+                           ? transfer_host_depth_source_rt_it->second
+                           : nullptr);
++                  REXGPU_DEBUG("transfer: {} <- {} tiles {}..{} host_depth={}",
++                               DescribeRenderTargetKey(dest),
++                               DescribeRenderTargetKey(transfer_source), it->first,
++                               transfer_end_tiles,
++                               DescribeRenderTargetKey(transfer_host_depth_source));
+                 }
+               }
+             }
 diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
 index 2c31a0e865855fe48e9fe6808e3f49c0ee4367e5..d6a00d2bc59e0287c6b4fad30514f1e87c761974 100644
 --- a/src/graphics/pipeline/shader/dxbc_translator.cpp
@@ -5134,6 +5807,40 @@ index a7d508a9e0db4742523689a8437d0cef98069dd3..db1407589958ef747e0d3deb07f668dc
      // Close the render target write check.
      a_.OpEndIf();
    }
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4ad0c3d61c8880195fb3c96f666068d89b..47ab932c68bbebe63d3a02a0227077eb9a6b4057 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -2029,11 +2029,26 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+           }
+         }
+ 
+-        // Apply the exponent bias from the bits 13:18 of the fetch constant
+-        // word 4.
++        // Apply the result exponent bias (exp_adjust) from the bits 13:18 of
++        // the fetch constant word 3, as the DXBC translator and Xenia do. Word 4
++        // holds the LOD bias at those bits, so reading it here scaled every
++        // sample of a texture with a non-zero LOD bias by a power of two
++        // (rexglue-sdk issue 456).
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(const_int_0_);
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
++        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
++            spv::OpBitcast, type_int_,
++            builder_->createLoad(
++                builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_,
++                                            id_vector_temp_),
++                spv::NoPrecision));
+         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
+             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
+-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
++            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
+                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
+         {
+           uint32_t result_remaining_components = used_result_nonzero_components;
 diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
 index 765c1417ec80d55dcbacfed37b5e396511ab3da0..850281a910eb5cbc666a491b59eea1da89f80464 100644
 --- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
@@ -9133,6 +9840,18 @@ index 0000000000000000000000000000000000000000..deec8f07cb13c77c3e9f030032986ce7
 +#endif  // SHADING_LANGUAGE_*_XE
 +
 +#endif  // XENIA_UI_SHADERS_XESL_XESLI_
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c81818347935dd79f03787f7a3142dac17..bf0f107ef1db7d541725da998517b3bc1c93fd4d 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -382,6 +382,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     }
+   }
+   merged_ranges.resize(merged_write + 1);
++  requested_ranges_.insert(requested_ranges_.end(), merged_ranges.begin(), merged_ranges.end());
+ 
+   for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
 diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
 index 305380e99599bf1e0fa5731d3bd32e0a7d9330e1..e86fe4c2ff0737b29447784fa444a305f48a3d3e 100644
 --- a/src/graphics/util/draw.cpp
@@ -9148,7 +9867,7 @@ index 305380e99599bf1e0fa5731d3bd32e0a7d9330e1..e86fe4c2ff0737b29447784fa444a305
        (rb_copy_dest_pitch.copy_dest_pitch + (xenos::kTextureTileWidthHeight - 1)) >>
        xenos::kTextureTileWidthHeightLog2;
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0d7de90e0 100644
+index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863c894c766 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -13,6 +13,7 @@
@@ -9159,7 +9878,16 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
  #include <iterator>
  #include <mutex>
  #include <string>
-@@ -2291,7 +2292,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2272,6 +2273,8 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
++  REXGPU_DEBUG("swap: frontbuffer={:#x} {}x{}", frontbuffer_ptr, frontbuffer_width,
++               frontbuffer_height);
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+@@ -2291,7 +2294,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
  
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
@@ -9169,7 +9897,43 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
    if (skip_present_due_async_placeholder) {
      static bool skipped_incomplete_frame_logged = false;
      if (!skipped_incomplete_frame_logged) {
-@@ -3611,6 +3613,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3097,7 +3101,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   if (use_dynamic_rendering) {
+     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
+-        current_render_pass_ == VK_NULL_HANDLE) {
++        current_render_pass_ == VK_NULL_HANDLE &&
++        current_transfer_dest_view_ == VK_NULL_HANDLE) {
+       return;
+     }
+   } else {
+@@ -3117,6 +3122,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+   current_framebuffer_ = framebuffer;
++  current_transfer_dest_view_ = VK_NULL_HANDLE;
+ 
+   if (use_dynamic_rendering) {
+     VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
+@@ -3171,7 +3177,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   if (use_dynamic_rendering) {
+     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
+-        current_render_pass_ == VK_NULL_HANDLE) {
++        current_render_pass_ == VK_NULL_HANDLE &&
++        current_transfer_dest_view_ == transfer_dest_view) {
+       return;
+     }
+   } else {
+@@ -3191,6 +3198,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+   current_framebuffer_ = framebuffer;
++  current_transfer_dest_view_ = transfer_dest_view;
+ 
+   if (use_dynamic_rendering) {
+     VkRenderingAttachmentInfo color_attachment = {};
+@@ -3611,6 +3619,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    };
  
    xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
@@ -9177,7 +9941,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
    if (edram_mode == xenos::EdramMode::kCopy) {
      // Special copy handling.
      return IssueCopy();
-@@ -3679,8 +3682,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3679,8 +3688,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      }
      draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
    }
@@ -9186,7 +9950,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -3745,7 +3746,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3745,7 +3752,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
                                                     *pixel_shader, interpolator_mask,
                                                     ps_param_gen_pos, normalized_depth_control)
                                               : SpirvShaderTranslator::Modification(0);
@@ -9194,7 +9958,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
      // Translate the shaders now to obtain the sampler bindings.
      vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
-@@ -3829,6 +3829,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3829,6 +3835,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                     : 0;
  
@@ -9202,7 +9966,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
    // Update the textures before most other work in the submission because
    // samplers depend on this (and in case of sampler overflow in a submission,
    // submissions must be split) - may perform dispatches and copying.
-@@ -3894,6 +3895,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3894,6 +3901,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          descriptor_sets_kept = std::min(
              descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
        }
@@ -9211,7 +9975,12 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
      } else {
        // No or unknown pipeline layout previously bound - all bindings are in an
        // indeterminate state.
-@@ -4118,7 +4121,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4114,11 +4123,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+       render_target_cache_->last_update_render_pass(),
+       render_target_cache_->last_update_framebuffer());
++  shared_memory_->NoteDrawReadsInOpenPass();
+ 
    // Draw.
    if (primitive_processing_result.index_buffer_type ==
            PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
@@ -9220,7 +9989,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,8 +4153,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,8 +4160,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -9231,7 +10000,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
    }
  
    // Invalidate textures in memexported memory and watch for changes.
-@@ -6559,32 +6562,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6559,32 +6569,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      sampler_count_pixel = 0;
      texture_count_pixel = 0;
    }
@@ -9266,7 +10035,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
      for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-@@ -6596,7 +6578,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6596,7 +6585,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
    size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
@@ -9275,7 +10044,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
           current_samplers_vertex_) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-@@ -6604,7 +6586,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6604,7 +6593,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
    size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
@@ -9284,7 +10053,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
      for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-@@ -6616,7 +6598,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6616,7 +6605,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
    size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
@@ -9293,58 +10062,163 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..b7ad3e4dd1f6682e83146ab40aa82cd0
      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
           current_samplers_pixel_) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-@@ -6624,6 +6606,49 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6624,6 +6613,64 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
  
-+  auto needs_texture_write = [&](uint32_t stage, uint32_t set_index,
-+                                  VkDescriptorSetLayout layout, size_t offset,
-+                                  uint32_t image_count, uint32_t sampler_count) {
-+    const uint32_t bit = UINT32_C(1) << set_index;
-+    const size_t count = size_t(image_count) + sampler_count;
-+    auto& previous = texture_descriptor_contents_[stage];
-+    bool changed = texture_descriptor_layouts_[stage] != layout ||
-+                   texture_descriptor_image_counts_[stage] != image_count ||
-+                   previous.size() != count;
-+    if (!changed) {
-+      for (size_t i = 0; i < count; ++i) {
-+        const auto& current = descriptor_write_image_info_[offset + i];
-+        const auto& old = previous[i];
-+        if (current.imageView != old.imageView || current.imageLayout != old.imageLayout ||
-+            current.sampler != old.sampler) {
-+          changed = true;
-+          break;
++  // Texture/sampler descriptor sets: the reference backend rewrites them for
++  // every draw. The comparing cache below is kept opt-in while it is being
++  // validated, because stale bindings show up as white/saturated surfaces.
++  static const bool cache_texture_descriptors =
++      std::getenv("TEKKEN6_CACHE_TEXTURE_DESCRIPTORS") != nullptr;
++  bool write_vertex_textures;
++  bool write_pixel_textures;
++  if (cache_texture_descriptors) {
++    auto needs_texture_write = [&](uint32_t stage, uint32_t set_index,
++                                   VkDescriptorSetLayout layout, size_t offset,
++                                   uint32_t image_count, uint32_t sampler_count) {
++      const uint32_t bit = UINT32_C(1) << set_index;
++      const size_t count = size_t(image_count) + sampler_count;
++      auto& previous = texture_descriptor_contents_[stage];
++      bool changed = texture_descriptor_layouts_[stage] != layout ||
++                     texture_descriptor_image_counts_[stage] != image_count ||
++                     previous.size() != count;
++      if (!changed) {
++        for (size_t i = 0; i < count; ++i) {
++          const auto& current = descriptor_write_image_info_[offset + i];
++          const auto& old = previous[i];
++          if (current.imageView != old.imageView || current.imageLayout != old.imageLayout ||
++              current.sampler != old.sampler) {
++            changed = true;
++            break;
++          }
 +        }
 +      }
-+    }
-+    if (changed) {
-+      current_graphics_descriptor_set_values_up_to_date_ &= ~bit;
-+    }
-+    if (!count || (current_graphics_descriptor_set_values_up_to_date_ & bit)) {
-+      return false;
-+    }
-+    previous.assign(descriptor_write_image_info_.begin() + offset,
-+                    descriptor_write_image_info_.begin() + offset + count);
-+    texture_descriptor_layouts_[stage] = layout;
-+    texture_descriptor_image_counts_[stage] = image_count;
-+    return true;
-+  };
-+  const bool write_vertex_textures = needs_texture_write(
-+      0, SpirvShaderTranslator::kDescriptorSetTexturesVertex,
-+      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
-+      vertex_texture_image_info_offset, texture_count_vertex, sampler_count_vertex);
-+  const bool write_pixel_textures = needs_texture_write(
-+      1, SpirvShaderTranslator::kDescriptorSetTexturesPixel,
-+      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
-+      pixel_texture_image_info_offset, texture_count_pixel, sampler_count_pixel);
++      if (changed) {
++        current_graphics_descriptor_set_values_up_to_date_ &= ~bit;
++      }
++      if (!count || (current_graphics_descriptor_set_values_up_to_date_ & bit)) {
++        return false;
++      }
++      previous.assign(descriptor_write_image_info_.begin() + offset,
++                      descriptor_write_image_info_.begin() + offset + count);
++      texture_descriptor_layouts_[stage] = layout;
++      texture_descriptor_image_counts_[stage] = image_count;
++      return true;
++    };
++    write_vertex_textures = needs_texture_write(
++        0, SpirvShaderTranslator::kDescriptorSetTexturesVertex,
++        current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
++        vertex_texture_image_info_offset, texture_count_vertex, sampler_count_vertex);
++    write_pixel_textures = needs_texture_write(
++        1, SpirvShaderTranslator::kDescriptorSetTexturesPixel,
++        current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
++        pixel_texture_image_info_offset, texture_count_pixel, sampler_count_pixel);
++  } else {
++    current_graphics_descriptor_set_values_up_to_date_ &=
++        ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
++          (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
++    write_vertex_textures = texture_count_vertex || sampler_count_vertex;
++    write_pixel_textures = texture_count_pixel || sampler_count_pixel;
++  }
 +  current_graphics_descriptor_sets_bound_up_to_date_ &=
 +      current_graphics_descriptor_set_values_up_to_date_;
 +
    // Write the new descriptor sets.
  
    // Consecutive bindings updated via a single VkWriteDescriptorSet must have
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033bc127a7ce0270607b2925643b0b7aa2df..c5538e17842a74456e04d559d2d5f37cb01c1b7b 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -30,6 +30,66 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
+ 
+ void DeferredCommandBuffer::Reset() {
+   command_stream_.clear();
++  pass_open_ = false;
++  upload_slots_.clear();
++  hoisted_regions_.clear();
++}
++
++void DeferredCommandBuffer::WriteUploadSlot() {
++  auto& args =
++      *reinterpret_cast<ArgsUploadSlot*>(WriteCommand(Command::kUploadSlot, sizeof(ArgsUploadSlot)));
++  args.slot = uint32_t(upload_slots_.size());
++  upload_slots_.emplace_back();
++  pass_open_ = true;
++  ++pass_serial_;
++}
++
++void DeferredCommandBuffer::HoistCopyBufferBeforeOpenPass(VkBuffer src_buffer, VkBuffer dst_buffer,
++                                                          uint32_t region_count,
++                                                          const VkBufferCopy* regions) {
++  assert_true(pass_open_ && !upload_slots_.empty());
++  HoistedCopy& copy = upload_slots_.back().copies.emplace_back();
++  copy.src_buffer = src_buffer;
++  copy.dst_buffer = dst_buffer;
++  copy.first_region = uint32_t(hoisted_regions_.size());
++  copy.region_count = region_count;
++  hoisted_regions_.insert(hoisted_regions_.end(), regions, regions + region_count);
++}
++
++void DeferredCommandBuffer::ExecuteUploadSlot(VkCommandBuffer command_buffer,
++                                              uint32_t slot) const {
++  const UploadSlot& upload_slot = upload_slots_[slot];
++  if (upload_slot.copies.empty()) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice::Functions& dfn =
++      command_processor_.GetVulkanDevice()->functions();
++  // The same conservative ordering the upload would have had in place: after
++  // every earlier read and write of the destination, before every later one.
++  VkBufferMemoryBarrier barrier = {};
++  barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  barrier.offset = 0;
++  barrier.size = VK_WHOLE_SIZE;
++  for (const HoistedCopy& copy : upload_slot.copies) {
++    barrier.buffer = copy.dst_buffer;
++    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier, 0,
++                             nullptr);
++    dfn.vkCmdCopyBuffer(command_buffer, copy.src_buffer, copy.dst_buffer, copy.region_count,
++                        hoisted_regions_.data() + copy.first_region);
++    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barrier.dstAccessMask = VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
++                            VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
++                            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
++                            VK_ACCESS_TRANSFER_WRITE_BIT;
++    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1, &barrier, 0,
++                             nullptr);
++  }
+ }
+ 
+ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+@@ -306,6 +366,10 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+         dfn.vkCmdSetStencilWriteMask(command_buffer, args.face_mask, args.mask_reference);
+       } break;
+ 
++      case Command::kUploadSlot: {
++        ExecuteUploadSlot(command_buffer, reinterpret_cast<const ArgsUploadSlot*>(stream)->slot);
++      } break;
++
+       case Command::kVkSetViewport: {
+         auto& args = *reinterpret_cast<const ArgsVkSetViewport*>(stream);
+         dfn.vkCmdSetViewport(command_buffer, args.first_viewport, args.viewport_count,
+@@ -374,6 +438,7 @@ void DeferredCommandBuffer::CmdVkPipelineBarrier(
+ 
+ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering_info) {
+   assert_null(rendering_info->pNext);
++  WriteUploadSlot();
+ 
+   size_t arguments_size =
+       rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
-index 91ac08f6c11d065793da02000b91057c73e2aa86..5ce558c4eb1e805df185ff9a77a44ec217ab85a0 100644
+index 91ac08f6c11d065793da02000b91057c73e2aa86..34f519f36212fb11f4497924ba7ada68c1f4aa86 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/src/graphics/vulkan/pipeline_cache.cpp
 @@ -13,6 +13,8 @@
@@ -9391,7 +10265,24 @@ index 91ac08f6c11d065793da02000b91057c73e2aa86..5ce558c4eb1e805df185ff9a77a44ec2
    if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
      using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
      if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
-@@ -3480,7 +3496,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+@@ -3214,6 +3230,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+       return false;
+   }
+   input_assembly_state.primitiveRestartEnable = description.primitive_restart ? VK_TRUE : VK_FALSE;
++#if defined(__APPLE__)
++  // Metal cannot disable primitive restart for strip topologies; MoltenVK fails
++  // pipeline creation (VK_ERROR_FEATURE_NOT_PRESENT) when it is off, which
++  // drops every draw using that pipeline. A strip that does not use restart
++  // has no all-ones indices, so leaving restart on is harmless for it.
++  if (input_assembly_state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ||
++      input_assembly_state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
++    input_assembly_state.primitiveRestartEnable = VK_TRUE;
++  }
++#endif
+ 
+   VkPipelineViewportStateCreateInfo viewport_state;
+   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+@@ -3480,7 +3506,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
    VkPipeline pipeline;
@@ -9400,7 +10291,7 @@ index 91ac08f6c11d065793da02000b91057c73e2aa86..5ce558c4eb1e805df185ff9a77a44ec2
                                                           &pipeline_create_info, nullptr, &pipeline);
    if (create_result != VK_SUCCESS) {
      uint64_t ps_hash = creation_arguments.pixel_shader
-@@ -3517,6 +3533,114 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+@@ -3517,6 +3543,114 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
    return true;
  }
  
@@ -9516,7 +10407,7 @@ index 91ac08f6c11d065793da02000b91057c73e2aa86..5ce558c4eb1e805df185ff9a77a44ec2
    while (true) {
      PipelineCreationArguments creation_arguments;
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f0628f59f75c020936e69a1043778d908270..b0f568fe5382e4607ad9411bdddd7d9611a27d4b 100644
+index 0298f0628f59f75c020936e69a1043778d908270..f4f90589f3023445632d8c3776f85d55d309f824 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -234,7 +234,15 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
@@ -9546,6 +10437,143 @@ index 0298f0628f59f75c020936e69a1043778d908270..b0f568fe5382e4607ad9411bdddd7d96
    InitializeCommon();
    return true;
  }
+@@ -1145,6 +1156,23 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+     return true;
+   }
+ 
++  {
++    const draw_util::ResolveEdramInfo& edram_info = resolve_info.IsCopyingDepth()
++                                                        ? resolve_info.depth_edram_info
++                                                        : resolve_info.color_edram_info;
++    REXGPU_DEBUG(
++        "resolve: {} base_tiles={} pitch_tiles={} msaa={} fmt={}{} {}x{} copy_len={:#x} -> "
++        "dest={:#x} pitch={} height={} dest_fmt={} clear_depth={} clear_color={}",
++        resolve_info.IsCopyingDepth() ? "depth" : "color", uint32_t(edram_info.base_tiles),
++        uint32_t(edram_info.pitch_tiles), 1u << uint32_t(edram_info.msaa_samples),
++        uint32_t(edram_info.format), edram_info.format_is_64bpp ? "(64bpp)" : "",
++        uint32_t(resolve_info.coordinate_info.width_div_8) << 3,
++        uint32_t(resolve_info.height_div_8) << 3, resolve_info.copy_dest_extent_length,
++        resolve_info.copy_dest_base, resolve_info.copy_dest_pitch, resolve_info.copy_dest_height,
++        uint32_t(resolve_info.copy_dest_info.copy_dest_format),
++        resolve_info.IsClearingDepth(), resolve_info.IsClearingColor());
++  }
++
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 6788214140959ff171291ad9285c5b9725e688a0..f888265ad4867c950c03c75201234cc33fb7f0b2 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -27,6 +27,11 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
+                     "Use sparse shared memory on Vulkan")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_hoist_uploads, true, "GPU/Vulkan",
++                    "Record guest memory uploads ahead of the open render pass when no draw in "
++                    "it reads the uploaded pages, instead of ending and restarting the pass")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::vulkan {
+ 
+ VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
+@@ -268,20 +273,68 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
+   return true;
+ }
+ 
++void VulkanSharedMemory::NoteDrawReadsInOpenPass() {
++  uint64_t serial = command_processor_.deferred_command_buffer().open_pass_serial();
++  if (serial != open_pass_reads_serial_) {
++    open_pass_reads_.clear();
++    open_pass_reads_serial_ = serial;
++  }
++  if (serial) {
++    open_pass_reads_.insert(open_pass_reads_.end(), requested_ranges_.begin(),
++                            requested_ranges_.end());
++  }
++  requested_ranges_.clear();
++}
++
++bool VulkanSharedMemory::OpenPassReadsAnyOf(
++    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) const {
++  if (open_pass_reads_serial_ != command_processor_.deferred_command_buffer().open_pass_serial()) {
++    return false;
++  }
++  for (const std::pair<uint32_t, uint32_t>& pages : upload_page_ranges) {
++    uint64_t upload_start = uint64_t(pages.first) << page_size_log2();
++    uint64_t upload_end = upload_start + (uint64_t(pages.second) << page_size_log2());
++    for (const std::pair<uint32_t, uint32_t>& read : open_pass_reads_) {
++      if (read.first < upload_end && uint64_t(read.first) + read.second > upload_start) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
+ bool VulkanSharedMemory::UploadRanges(
+     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
+-  // upload_page_ranges are sorted, use them to determine the range for the
+-  // ordering barrier.
+-  Use(Usage::kTransferDestination,
+-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
+-                      upload_page_ranges.front().first)
+-                         << page_size_log2()));
+-  command_processor_.SubmitBarriers(true);
++  // Breaking the render pass for an upload costs a full store and reload of
++  // its attachments on a tile-based GPU, so when nothing in the open pass reads
++  // the pages, the copy goes ahead of the pass instead. Only while the buffer
++  // is plain-read (no GPU writes to order against).
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++  const bool hoist = REXCVAR_GET(vulkan_hoist_uploads) && command_buffer.open_pass_serial() &&
++                     last_usage_ == Usage::kRead && !last_written_range_.second &&
++                     !OpenPassReadsAnyOf(upload_page_ranges);
++  if (!hoist) {
++    // upload_page_ranges are sorted, use them to determine the range for the
++    // ordering barrier.
++    Use(Usage::kTransferDestination,
++        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
++                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
++                        upload_page_ranges.front().first)
++                           << page_size_log2()));
++    command_processor_.SubmitBarriers(true);
++  }
++  auto record_copy = [&](VkBuffer source) {
++    if (hoist) {
++      command_buffer.HoistCopyBufferBeforeOpenPass(source, buffer_, uint32_t(upload_regions_.size()),
++                                                   upload_regions_.data());
++    } else {
++      command_buffer.CmdVkCopyBuffer(source, buffer_, uint32_t(upload_regions_.size()),
++                                     upload_regions_.data());
++    }
++  };
+   uint64_t submission_current = command_processor_.GetCurrentSubmission();
+   bool successful = true;
+   upload_regions_.clear();
+@@ -306,8 +359,7 @@ bool VulkanSharedMemory::UploadRanges(
+                   upload_buffer_size);
+       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
+         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
+-        command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+-                                       uint32_t(upload_regions_.size()), upload_regions_.data());
++        record_copy(upload_buffer_previous);
+         upload_regions_.clear();
+       }
+       upload_buffer_previous = upload_buffer;
+@@ -325,8 +377,7 @@ bool VulkanSharedMemory::UploadRanges(
+   }
+   if (!upload_regions_.empty()) {
+     assert_true(upload_buffer_previous != VK_NULL_HANDLE);
+-    command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+-                                   uint32_t(upload_regions_.size()), upload_regions_.data());
++    record_copy(upload_buffer_previous);
+     upload_regions_.clear();
+   }
+   return successful;
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
 index ecbd940d8fa4dac148808f8d88ca0dd1967b6e1c..d2907d600a0a2ba6d8ea82d285d1019a5c721dd9 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
@@ -9758,10 +10786,65 @@ index bd5de6559fcb473aaed81b60afd7d6f3ca7cdece..06ea06063c85a7a620308f67bd7579bd
            "NtQueryInformationFile(XFileXctdCompressionInformation) "
            "unimplemented");
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
-index 57fd161494784be66f6de114e8ca1cccc51fdb04..7a26322d95d647b671a98367a1ef4378c7179565 100644
+index 57fd161494784be66f6de114e8ca1cccc51fdb04..e007832b906f873d746c6caa00aa0bd114eccc5e 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
-@@ -839,15 +839,8 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
+@@ -473,7 +473,9 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
+ }
+ 
+ u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+-  return xeKeSetEvent(event_ptr, increment, wait);
++  auto result = xeKeSetEvent(event_ptr, increment, wait);
++  REXKRNL_TRACE("[KeSetEvent] ev={:#x} prev={}", event_ptr.guest_address(), result);
++  return result;
+ }
+ 
+ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+@@ -487,6 +489,7 @@ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+ }
+ 
+ u32 KeResetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr) {
++  REXKRNL_TRACE("[KeResetEvent] ev={:#x}", event_ptr.guest_address());
+   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
+   if (!ev) {
+     assert_always();
+@@ -544,7 +547,9 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
+ }
+ 
+ u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+-  return xeNtSetEvent(handle, previous_state_ptr);
++  auto result = xeNtSetEvent(handle, previous_state_ptr);
++  REXKRNL_TRACE("[NtSetEvent] handle={:#x} -> {:#x}", handle, result);
++  return result;
+ }
+ 
+ u32 NtPulseEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+@@ -577,6 +582,7 @@ uint32_t xeNtClearEvent(uint32_t handle) {
+ }
+ 
+ u32 NtClearEvent_entry(u32 handle) {
++  REXKRNL_TRACE("[NtClearEvent] handle={:#x}", handle);
+   return xeNtClearEvent(handle);
+ }
+ 
+@@ -670,6 +676,8 @@ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previ
+   if (previous_count_ptr) {
+     *previous_count_ptr = (uint32_t)previous_count;
+   }
++  REXKRNL_TRACE("[NtReleaseSemaphore] handle={:#x} count={} prev={} -> {:#x}", sem_handle,
++                       release_count, previous_count, result);
+ 
+   return result;
+ }
+@@ -726,6 +734,7 @@ u32 NtReleaseMutant_entry(u32 mutant_handle, u32 unknown) {
+   } else {
+     result = X_STATUS_INVALID_HANDLE;
+   }
++  REXKRNL_TRACE("[NtReleaseMutant] handle={:#x} -> {:#x}", mutant_handle, result);
+ 
+   return result;
+ }
+@@ -839,14 +848,13 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
  u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                  u32 alertable, mapped_u64 timeout_ptr) {
    uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
@@ -9770,15 +10853,62 @@ index 57fd161494784be66f6de114e8ca1cccc51fdb04..7a26322d95d647b671a98367a1ef4378
 -  // object_ptr.guest_address(), (uint32_t)wait_reason,
 -  //(uint32_t)processor_mode, (uint32_t)alertable,
 -  // timeout_ptr ? (int64_t)timeout : -1);
--  auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
--                                        timeout_ptr ? &timeout : nullptr);
++  REXKRNL_TRACE("[KeWaitForSingleObject] obj={:#x} alertable={} timeout={}",
++                       object_ptr.guest_address(), (uint32_t)alertable,
++                       timeout_ptr ? (int64_t)timeout : -1);
+   auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
+                                         timeout_ptr ? &timeout : nullptr);
 -  // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
--  return result;
-+  return xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
-+                                 timeout_ptr ? &timeout : nullptr);
++  REXKRNL_TRACE("[KeWaitForSingleObject] obj={:#x} -> {:#x}", object_ptr.guest_address(),
++                       result);
+   return result;
  }
  
- u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
+@@ -857,6 +865,8 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
+   if (object) {
+     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
++    REXKRNL_TRACE("[NtWaitForSingleObjectEx] handle={:#x} alertable={} timeout={}",
++                         object_handle, (uint32_t)alertable, timeout_ptr ? (int64_t)timeout : -1);
+     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+     if (alertable && result == X_STATUS_USER_APC) {
+       XThread::GetCurrentThread()->DeliverAPCs();
+@@ -864,6 +874,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+   } else {
+     result = X_STATUS_INVALID_HANDLE;
+   }
++  REXKRNL_TRACE("[NtWaitForSingleObjectEx] handle={:#x} -> {:#x}", object_handle, result);
+ 
+   return result;
+ }
+@@ -932,11 +943,15 @@ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u
+   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
+   if (signal_object && wait_object) {
+     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
++    REXKRNL_TRACE("[NtSignalAndWaitForSingleObjectEx] signal={:#x} wait={:#x} alertable={} timeout={}", signal_handle,
++                         wait_handle, (uint32_t)alertable, timeout_ptr ? (int64_t)timeout : -1);
+     result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
+                                     timeout_ptr ? &timeout : nullptr);
+   } else {
+     result = X_STATUS_INVALID_HANDLE;
+   }
++  REXKRNL_TRACE("[NtSignalAndWaitForSingleObjectEx] signal={:#x} wait={:#x} -> {:#x}",
++                       signal_handle, wait_handle, result);
+ 
+   if (alertable && result == X_STATUS_USER_APC) {
+     XThread::GetCurrentThread()->DeliverAPCs();
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index fc46d8692c8461bf5388f28775b9a257bd61d708..3f3ab3e25205d12ae06a82f49d7afd10e51fb4f1 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -70,6 +70,7 @@ rex_target_pch(rexruntime
+ 
+ target_include_directories(rexruntime PUBLIC
+     $<BUILD_INTERFACE:${REXGLUE_ROOT}/include>
++    $<BUILD_INTERFACE:${REXGLUE_ROOT}/thirdparty/imgui>
+     $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+ )
 diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
 index bd4310951d479706603e033b208b4cd16b0a486c..a513b668824450b74b79ddc0a66812ca8b2e9074 100644
 --- a/src/system/function_dispatcher.cpp
@@ -9794,6 +10924,103 @@ index bd4310951d479706603e033b208b4cd16b0a486c..a513b668824450b74b79ddc0a66812ca
  }
  
  PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 697399cdd4207c779610127c01e5285e580767de..524be997f7d82a6d4ccc407fe406d8c5ea72cc99 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -9,7 +9,10 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <chrono>
++#include <cstdlib>
++#include <cstdio>
+ #include <cstring>
+ #include <filesystem>
+ #include <string>
+@@ -56,6 +59,59 @@ KernelState* kernel_state() {
+   return shared_kernel_state_;
+ }
+ 
++namespace {
++
++const char* ObjectTypeName(XObject::Type type) {
++  switch (type) {
++    case XObject::Type::Event: return "event";
++    case XObject::Type::File: return "file";
++    case XObject::Type::IOCompletion: return "iocompletion";
++    case XObject::Type::Module: return "module";
++    case XObject::Type::Mutant: return "mutant";
++    case XObject::Type::NotifyListener: return "notifylistener";
++    case XObject::Type::Semaphore: return "semaphore";
++    case XObject::Type::Session: return "session";
++    case XObject::Type::Socket: return "socket";
++    case XObject::Type::SymbolicLink: return "symlink";
++    case XObject::Type::Thread: return "thread";
++    case XObject::Type::Timer: return "timer";
++    default: return "other";
++  }
++}
++
++std::atomic<bool> g_dump_watchdog_started{false};
++
++}  // namespace
++
++// Prints every waitable kernel object with its host state and what each guest
++// thread is blocked on. Triggered by creating the file named in the
++// REX_DEBUG_DUMP_TRIGGER environment variable while the game runs.
++void KernelState::DumpKernelObjects() {
++  auto objects = object_table_.GetAllObjects();
++  std::string out = fmt::format("==== kernel object dump: {} objects\n", objects.size());
++  for (auto& object : objects) {
++    auto type = object->type();
++    if (type == XObject::Type::Thread) {
++      auto* thread = static_cast<XThread*>(object.get());
++      out += fmt::format("thread {:#x} tid={:#x} running={} name='{}' waiting_on={:#x} {:#x} {:#x}\n",
++                         object->handle(), thread->thread_id(), thread->is_running(),
++                         object->name(), thread->debug_wait(0), thread->debug_wait(1),
++                         thread->debug_wait(2));
++      continue;
++    }
++    if (type != XObject::Type::Event && type != XObject::Type::Mutant &&
++        type != XObject::Type::Semaphore && type != XObject::Type::Timer) {
++      continue;
++    }
++    out += fmt::format("{} {:#x} name='{}' {}\n", ObjectTypeName(type), object->handle(),
++                       object->name(), object->DebugWaitState());
++  }
++  out += "==== end of dump\n";
++  fputs(out.c_str(), stderr);
++  fflush(stderr);
++  REXSYS_WARN("{}", out);
++}
++
+ KernelState::KernelState(Runtime* emulator)
+     : emulator_(emulator),
+       memory_(emulator->memory()),
+@@ -64,6 +120,21 @@ KernelState::KernelState(Runtime* emulator)
+   function_dispatcher_ = emulator->function_dispatcher();
+   file_system_ = emulator->file_system();
+ 
++  if (const char* trigger = std::getenv("REX_DEBUG_DUMP_TRIGGER");
++      trigger && *trigger && !g_dump_watchdog_started.exchange(true)) {
++    std::string trigger_path = trigger;
++    std::thread([this, trigger_path] {
++      while (true) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(300));
++        std::error_code ec;
++        if (std::filesystem::exists(trigger_path, ec)) {
++          std::filesystem::remove(trigger_path, ec);
++          DumpKernelObjects();
++        }
++      }
++    }).detach();
++  }
++
+   app_manager_ = std::make_unique<xam::AppManager>();
+   user_profile_ = std::make_unique<xam::UserProfile>();
+   user_profile_->set_kernel_state(this);
 diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
 index 2b930058bad8ef3c9832e82e0e9b50491425ec82..022c60d4e24df3df900d90e7fff41d301f6626ef 100644
 --- a/src/system/mmio_handler.cpp
@@ -10279,6 +11506,61 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..a53a48444409635aa5d265d391b8cad0
      REXSYS_ERROR(
          "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
          is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index d358f399d84f196be91eafc620a7e6d4242d2f5d..d9760e82bba001017f620085e16e080e7d86e3b5 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -200,6 +200,24 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+   }
+ }
+ 
++
++namespace {
++// Records what the current guest thread is blocked on, for the hang dump.
++struct DebugWaitScope {
++  XThread* thread;
++  DebugWaitScope(uint32_t a, uint32_t b = 0, uint32_t c = 0) : thread(XThread::GetCurrentThread()) {
++    if (thread) {
++      thread->SetDebugWait(a, b, c);
++    }
++  }
++  ~DebugWaitScope() {
++    if (thread) {
++      thread->SetDebugWait(0, 0, 0);
++    }
++  }
++};
++}  // namespace
++
+ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                        uint64_t* opt_timeout) {
+   auto wait_handle = GetWaitHandle();
+@@ -207,6 +225,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+     // Object doesn't support waiting.
+     return X_STATUS_SUCCESS;
+   }
++  DebugWaitScope debug_wait(handle());
+ 
+   auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
+                                       TimeoutTicksToMs(*opt_timeout)))
+@@ -239,6 +258,7 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+                                       TimeoutTicksToMs(*opt_timeout)))
+                                 : std::chrono::milliseconds::max();
+ 
++  DebugWaitScope debug_wait(wait_object->handle(), signal_object->handle());
+   auto result =
+       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
+                                  alertable ? true : false, timeout_ms);
+@@ -267,6 +287,9 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+     wait_handles[i] = objects[i]->GetWaitHandle();
+     assert_not_null(wait_handles[i]);
+   }
++  DebugWaitScope debug_wait(count > 0 ? objects[0]->handle() : 0,
++                            count > 1 ? objects[1]->handle() : 0,
++                            count > 2 ? objects[2]->handle() : 0);
+ 
+   auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
+                                       TimeoutTicksToMs(*opt_timeout)))
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
 index 77bce2561bfd97d229f9348bb91b17d1154cf0b9..8b101569ba097fabc00fa01fd76908621264c595 100644
 --- a/src/system/xthread.cpp
@@ -10411,7 +11693,7 @@ index b94fe9e4814b7e66305d3b983732aebdfb0bced4..020fb58d412109dda15d48a527ef9fcf
        debug_overlay_.reset();
      } else {
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index 23645effaa5b659471aae7375b3b0fd48f41c35e..69da1ed3d2d5dfc93c1616f95b1d07c42e3e3c41 100644
+index 23645effaa5b659471aae7375b3b0fd48f41c35e..5acfdf100e5250d25019b6543439278b245f945d 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/src/ui/vulkan/vulkan_presenter.cpp
 @@ -11,6 +11,7 @@
@@ -10449,6 +11731,16 @@ index 23645effaa5b659471aae7375b3b0fd48f41c35e..69da1ed3d2d5dfc93c1616f95b1d07c4
      }
      // Incremented the reference count of the guest output image - safe to leave
      // the consumer critical section now as everything here either will be using
+@@ -2589,6 +2595,9 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffec
+   VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {};
+   input_assembly_state.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+   input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
++  // This pass draws four non-indexed vertices, so restart cannot affect its
++  // geometry. Metal requires restart to be enabled for strip topologies.
++  input_assembly_state.primitiveRestartEnable = VK_TRUE;
+ 
+   VkPipelineViewportStateCreateInfo viewport_state = {};
+   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
 diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
 index 9eeb9025c1906483cbd0e1ad4cd11d6e6735f6fc..70fa40df06b1e18e2b732ca96a95c2c1e2981837 100644
 --- a/src/ui/vulkan/vulkan_provider.cpp
@@ -10501,10 +11793,18 @@ index 9eeb9025c1906483cbd0e1ad4cd11d6e6735f6fc..70fa40df06b1e18e2b732ca96a95c2c1
          break;
        }
 diff --git a/src/ui/window.cpp b/src/ui/window.cpp
-index b4e045f3fe58a6647c467957470e567fd1c92a64..d08746a92761cb1d4a756fd4eb95272a01457975 100644
+index b4e045f3fe58a6647c467957470e567fd1c92a64..e6389db396efa3cf9d51f3c5c0feed1a9bd281cf 100644
 --- a/src/ui/window.cpp
 +++ b/src/ui/window.cpp
-@@ -34,7 +34,7 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
+@@ -31,10 +31,15 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
+     .range(0, 8192)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(window_high_pixel_density, true, "UI/Window",
++                    "Use a high-density back buffer on Retina/HiDPI displays. "
++                    "Disable to reduce presentation pixel count without changing the display mode")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
  // kHotReload (default): Window::SetFullscreen can be applied live, so the
  // change callback registered in ReXApp::SetupPresentation keeps the window
  // in sync whenever this cvar is changed at runtime.
@@ -10514,10 +11814,22 @@ index b4e045f3fe58a6647c467957470e567fd1c92a64..d08746a92761cb1d4a756fd4eb95272a
  REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                       "Monitor index to display on (0 = default, 1 = primary, 2 = "
 diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
-index 2251429b7f5c0791262a6d3a866bf039c952b1d0..ea627196c00da7e10ac9b1dab617e9a74c8c6030 100644
+index 2251429b7f5c0791262a6d3a866bf039c952b1d0..af04385b92e95ab961e3d95986872ce3ba89f3d2 100644
 --- a/src/ui/window_sdl.cpp
 +++ b/src/ui/window_sdl.cpp
-@@ -174,6 +174,13 @@ bool WindowSDL::OpenImpl() {
+@@ -136,7 +136,10 @@ WindowSDL::~WindowSDL() {
+ bool WindowSDL::OpenImpl() {
+   // SDL window coordinates are physical pixels on Windows and X11. Cocoa
+   // uses logical points and applies the backing scale itself.
+-  SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
++  SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN;
++  if (REXCVAR_GET(window_high_pixel_density)) {
++    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
++  }
+ #if REX_PLATFORM_MAC
+   int initial_width = int(GetDesiredLogicalWidth());
+   int initial_height = int(GetDesiredLogicalHeight());
+@@ -174,6 +177,13 @@ bool WindowSDL::OpenImpl() {
      // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
      SDL_SetWindowFullscreen(sdl_window_, true);
    }

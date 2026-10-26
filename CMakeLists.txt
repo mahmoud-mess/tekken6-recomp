@@ -7,8 +7,15 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
+# FMA3 is an x86-64 extension. On arm64 hosts (Apple Silicon) the generated
+# code's fused operations already lower to native NEON FMA, so default it off.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    set(TEKKEN6_FMA3_DEFAULT ON)
+else()
+    set(TEKKEN6_FMA3_DEFAULT OFF)
+endif()
 option(TEKKEN6_ENABLE_FMA3
-    "Compile generated guest code for CPUs with FMA3" ON)
+    "Compile generated guest code for CPUs with FMA3" ${TEKKEN6_FMA3_DEFAULT})
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,7 +61,9 @@ if(MINGW AND TARGET rexruntime)
 endif()
 
 add_executable(tekken6 src/main.cpp src/tekken6_guest_hooks.cpp src/internal_resolution.cpp)
-target_compile_options(tekken6 PRIVATE -mssse3)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+    target_compile_options(tekken6 PRIVATE -mssse3)
+endif()
 if(WIN32)
     target_sources(tekken6 PRIVATE src/tekken6_crash_win.cpp)
     target_link_libraries(tekken6 PRIVATE dbghelp)
