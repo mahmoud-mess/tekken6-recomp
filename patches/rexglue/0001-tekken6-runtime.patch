@@ -677,6 +677,77 @@ index 104bdad34542f8d60efff69e0f80ced2ff7ef10d..0485ee4597996fc3c3128b182c74795a
  };
  
  }  // namespace rex::graphics::vulkan
+diff --git a/include/rex/pacing_log.h b/include/rex/pacing_log.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f29e735fc1b5afda03d4e655be591907d8fc49ff
+--- /dev/null
++++ b/include/rex/pacing_log.h
+@@ -0,0 +1,65 @@
++#pragma once
++
++// TEKKEN6_PACING_LOG=<file>: frame pacing events, one per line, for
++// measurement only. Times are host nanoseconds on the clock Core Animation
++// uses for display timestamps (CLOCK_UPTIME_RAW on macOS).
++//   v <t>                              guest vblank
++//   s <t> shader                       frame not shown: a shader still compiling
++//   f <t> <version>                    guest frame handed to the presenter
++//   p <t> <present id> <version>       present carrying a new guest frame
++//   d <present id> <actual> <earliest> <margin>
++//                                      when that present reached the display
++//                                      (VK_GOOGLE_display_timing)
++// Each library that logs opens the file itself, in append mode.
++
++#include <chrono>
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++
++#if defined(__APPLE__)
++#include <time.h>
++#endif
++
++namespace rex::pacing {
++
++inline FILE* File() {
++  static FILE* file = [] {
++    const char* path = std::getenv("TEKKEN6_PACING_LOG");
++    FILE* f = (path && *path) ? std::fopen(path, "a") : nullptr;
++    if (f) {
++      std::setvbuf(f, nullptr, _IOLBF, 1 << 12);
++    }
++    return f;
++  }();
++  return file;
++}
++
++inline bool Enabled() { return File() != nullptr; }
++
++inline uint64_t Now() {
++#if defined(__APPLE__)
++  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++#else
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++#endif
++}
++
++inline void Log(const char* format, ...) {
++  FILE* f = File();
++  if (!f) {
++    return;
++  }
++  static std::mutex mutex;
++  std::lock_guard<std::mutex> lock(mutex);
++  va_list args;
++  va_start(args, format);
++  std::vfprintf(f, format, args);
++  va_end(args);
++}
++
++}  // namespace rex::pacing
 diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
 index 0ede54262059bff41c8c1f5047602fe406d68e03..b16b9949428b14761cd356494115ec1772c0367a 100644
 --- a/include/rex/ppc/context.h
@@ -914,6 +985,55 @@ index fa2ef60581b70f8648a5f5bd0aa09c03e5842aa3..38debed0dd623dffa9ac02e1fcccbf5a
  REXCVAR_DECLARE(bool, fullscreen);
  REXCVAR_DECLARE(int32_t, monitor);
  REXCVAR_DECLARE(std::string, video_driver);
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30b2619b9823c394171047b74db7031b124..a4f5acf8b038eee7708138c5f33800000b92a4ab 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -362,6 +362,16 @@ class Presenter {
+   // multiple at the same time, and it should acquire the latest guest output
+   // image via ConsumeGuestOutput.
+   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
++
++  // The refresh period of the display the guest output is presented on, in
++  // nanoseconds, measured from presentation timestamps; 0 if unknown. The guest
++  // vblank timer follows it so that guest frames and display refreshes don't
++  // drift apart. Callable from any thread.
++  virtual uint64_t GetHostRefreshPeriodNs() const { return 0; }
++  // How far to move the guest vblank timer (positive: later) so guest frames
++  // reach the presenter at the same point of the display's refresh cycle;
++  // returns the amount requested since the last call. Callable from any thread.
++  virtual int64_t TakeGuestVblankShiftNs() { return 0; }
+   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
+     return guest_output_paint_config_;
+   }
+@@ -933,6 +943,15 @@ class Presenter {
+   // repaint request anyway.
+   std::atomic<bool> ui_thread_paint_requested_{false};
+ 
++ protected:
++  // Whether the guest output has been refreshed since it was last consumed.
++  bool IsNewGuestOutputReady() const {
++    uint32_t acquired_and_ready = guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
++    return (acquired_and_ready >> 2) != (acquired_and_ready & 3);
++  }
++
++ private:
++
+   std::mutex guest_output_paint_config_mutex_;
+   // UI thread: writable, guest output thread: read-only.
+   GuestOutputPaintConfig guest_output_paint_config_;
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 947817feb0a934206d542f28f77ac69b8651dd9c..f6b5cf0096e8560d2cf4e8a702db3a6b46c3701d 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -182,6 +182,7 @@ class VulkanDevice {
+   // `ext_major_minor_` prefix rather than `ext_`).
+   struct Extensions {
+     bool ext_KHR_swapchain = false;                     // #2
++    bool ext_GOOGLE_display_timing = false;             // #93
+     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
+     bool ext_EXT_shader_stencil_export = false;         // #141
+     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
 diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
 index aa55a4a284d966b2de2251a2c7aa595c741ca046..54a59f7846de997885a1ff249444a3955922b262 100644
 --- a/include/rex/ui/vulkan/functions/device_1_0.inc
@@ -929,6 +1049,73 @@ index aa55a4a284d966b2de2251a2c7aa595c741ca046..54a59f7846de997885a1ff249444a395
  XE_UI_VULKAN_FUNCTION(vkCreateGraphicsPipelines)
  XE_UI_VULKAN_FUNCTION(vkCreateImage)
  XE_UI_VULKAN_FUNCTION(vkCreateImageView)
+diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
+index 56ee43bf7981cfdf7841b3ba1c14f862f54a49f5..46475c03ae09e2cc50a095120943b87455643118 100644
+--- a/include/rex/ui/vulkan/presenter.h
++++ b/include/rex/ui/vulkan/presenter.h
+@@ -130,6 +130,19 @@ class VulkanPresenter final : public Presenter {
+ 
+   bool CaptureGuestOutput(RawImage& image_out) override;
+ 
++  // Only while steering: there the display takes images at a fixed rate. On a
++  // display that shows frames as they come, the measured period is just the
++  // guest's own frame rate coming back, and following it would let the guest
++  // drift slower or faster.
++  uint64_t GetHostRefreshPeriodNs() const override {
++    return present_pacing_steering_.load(std::memory_order_relaxed)
++               ? present_pacing_refresh_ns_.load(std::memory_order_relaxed)
++               : 0;
++  }
++  int64_t TakeGuestVblankShiftNs() override {
++    return present_pacing_shift_ns_.exchange(0, std::memory_order_relaxed);
++  }
++
+   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
+     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
+   }
+@@ -481,6 +494,42 @@ class VulkanPresenter final : public Presenter {
+   // well as by presenter initialization and shutdown.
+   PaintContext paint_context_;
+ 
++  // Present pacing (vulkan_present_pacing): when guest frames reach the screen,
++  // from VK_GOOGLE_display_timing, steers the guest vblank timer's rate and
++  // phase (GetHostRefreshPeriodNs, TakeGuestVblankShiftNs). Painting only.
++  struct PresentPacing {
++    uint64_t nominal_refresh_ns = 0;  // vkGetRefreshCycleDurationGOOGLE
++    uint64_t nominal_checked_ns = 0;
++    double refresh_ns = 0.0;          // guest frame period in refreshes, refined
++    uint64_t last_version = UINT64_MAX;
++    uint64_t last_new_frame_ns = 0;   // when the newest guest frame was presented
++    uint32_t next_present_id = 0;
++    uint32_t last_shown_id = 0;
++    uint64_t last_shown_ns = 0;
++    std::array<uint64_t, 64> presented_at_by_id = {};
++    // Present-to-screen waits seen while calibrating, and the middle of their
++    // range once calibrated.
++    std::array<double, 160> wait_history = {};
++    size_t wait_history_count = 0;
++    bool calibrated = false;
++    // No sawtooth found (the display shows frames as they come): don't steer,
++    // and calibrate again after a while.
++    bool steering = false;
++    uint32_t frames_since_calibration = 0;
++    // Steering requested over the last stretch of frames: if it keeps going
++    // one way without the waits settling, the display doesn't take images at
++    // fixed points after all (ProMotion can show frames as they come).
++    double drift_ns = 0.0;
++    uint32_t drift_frames = 0;
++    double wait_middle_ns = 0.0;
++  };
++  PresentPacing present_pacing_;
++  std::atomic<uint64_t> present_pacing_refresh_ns_{0};
++  std::atomic<int64_t> present_pacing_shift_ns_{0};
++  std::atomic<bool> present_pacing_steering_{false};
++  bool UpdatePresentPacing(uint64_t now_ns);
++  void ResetPresentPacingForNewSwapchain();
++
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+   void* temporal_upscaler_context_ = nullptr;
+   uint32_t temporal_upscaler_max_render_width_ = 0;
 diff --git a/resources/templates/codegen/_indirect_call.inja b/resources/templates/codegen/_indirect_call.inja
 index d4b1830b277014fec9c9395a091b779d20298abd..98db96d8831cc4d4516fb8af7900cc7086bd7754 100644
 --- a/resources/templates/codegen/_indirect_call.inja
@@ -2605,18 +2792,120 @@ index 2be0e8eec88a419b06ad34354ae738a0c286b87f..5572b8c3bab48665a14dcbfc5944a5f9
    ID3D12Device* device = provider.GetDevice();
    // Assuming untiling will be the next operation.
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..8441a24f3f7a5ed3d9b79d898a2ead9a0ce63f4e 100644
+index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..6b54e01154bd94ceca6b6df96aac59f4348b2ba3 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
-@@ -14,6 +14,7 @@
+@@ -9,11 +9,21 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/pacing_log.h>
+ #include <rex/graphics/graphics_system.h>
+ 
  #include <algorithm>
  #include <cctype>
++#if defined(__APPLE__)
++#include <mach/mach.h>
++#include <mach/mach_time.h>
++#include <mach/thread_policy.h>
++#include <pthread.h>
++#include <pthread/qos.h>
++#endif
++#include <cmath>
  #include <cstdint>
 +#include <filesystem>
  #include <functional>
  #include <memory>
  #include <mutex>
-@@ -203,6 +204,41 @@ void GraphicsSystem::Shutdown() {
+@@ -150,6 +160,28 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+   vsync_worker_running_ = true;
+   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
+       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
++#if defined(__APPLE__)
++        // Ordinary threads wake up milliseconds late when the CPU is busy:
++        // schedule this one as real time, like an audio thread (it does
++        // well under a millisecond of work per 16.7 ms).
++        {
++          mach_timebase_info_data_t timebase;
++          mach_timebase_info(&timebase);
++          auto ns_to_abs = [&](double ns) {
++            return uint32_t(ns * double(timebase.denom) / double(timebase.numer));
++          };
++          thread_time_constraint_policy_data_t policy;
++          policy.period = ns_to_abs(1.0e9 / 60.0);
++          policy.computation = ns_to_abs(1.0e6);
++          policy.constraint = ns_to_abs(2.0e6);
++          policy.preemptible = 1;
++          if (thread_policy_set(pthread_mach_thread_np(pthread_self()),
++                                THREAD_TIME_CONSTRAINT_POLICY, thread_policy_t(&policy),
++                                THREAD_TIME_CONSTRAINT_POLICY_COUNT) != KERN_SUCCESS) {
++            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++          }
++        }
++#endif
+         system::X_VIDEO_MODE video_mode;
+         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+         double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
+@@ -157,16 +189,52 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+         uint64_t vsync_interval_ticks =
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+-        uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        // A guest frame at the display's own refresh rate (one or two
++        // refreshes at 60 or 120 Hz) when that's within 0.6% of the guest's,
++        // so guest frames and display refreshes don't drift apart.
++        auto vblank_interval_ticks = [&]() -> uint64_t {
++          uint64_t refresh_ns = presenter_ ? presenter_->GetHostRefreshPeriodNs() : 0;
++          if (refresh_ns) {
++            double guest_ns = 1.0e9 / refresh_rate_hz;
++            double frame_ns = double(refresh_ns) * std::max(1.0, std::round(guest_ns / refresh_ns));
++            if (std::abs(frame_ns - guest_ns) < 0.006 * guest_ns) {
++              return std::max(uint64_t(1), uint64_t(frame_ns * double(guest_tick_frequency) / 1.0e9));
++            }
++          }
++          return vsync_interval_ticks;
++        };
++        uint64_t next_vblank = chrono::Clock::QueryGuestTickCount() + vsync_interval_ticks;
+         while (vsync_worker_running_) {
+-          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+-          while (current_time - last_frame_time >= interval_ticks) {
++              REXCVAR_GET(vsync) ? vblank_interval_ticks() : no_vsync_interval_ticks;
++          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
++          if (current_time >= next_vblank) {
+             MarkVblank();
+-            last_frame_time += interval_ticks;
++            next_vblank += interval_ticks;
++            // Move toward the phase where frames reach the screen evenly, at
++            // most a millisecond per frame.
++            if (REXCVAR_GET(vsync) && presenter_) {
++              int64_t shift_ns = std::clamp<int64_t>(presenter_->TakeGuestVblankShiftNs(), -1000000,
++                                                     1000000);
++              next_vblank = uint64_t(int64_t(next_vblank) +
++                                     shift_ns * int64_t(guest_tick_frequency) / 1000000000);
++            }
++            // After a stall (debugger, sleep), resume the cadence from now
++            // instead of firing the missed vblanks back to back.
++            if (current_time >= next_vblank + 4 * interval_ticks) {
++              next_vblank = current_time + interval_ticks;
++            }
++            continue;
++          }
++          // Sleep until shortly before the deadline, then yield until it: a
++          // 1 ms polling sleep put up to a millisecond of jitter on every guest
++          // frame.
++          uint64_t remaining_us = (next_vblank - current_time) * 1000000 / guest_tick_frequency;
++          if (remaining_us > 400) {
++            rex::thread::Sleep(std::chrono::microseconds(std::min<uint64_t>(remaining_us - 300, 20000)));
++          } else {
++            rex::thread::MaybeYield();
+           }
+-          rex::thread::Sleep(std::chrono::milliseconds(1));
+         }
+         return 0;
+       }));
+@@ -203,6 +271,41 @@ void GraphicsSystem::Shutdown() {
    provider_.reset();
  }
  
@@ -2658,6 +2947,16 @@ index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..8441a24f3f7a5ed3d9b79d898a2ead9a
  void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_responsible) {
    // TODO(Triang3l): Somehow gain exclusive ownership of the Provider (may be
    // used by the command processor, the presenter, and possibly anything else,
+@@ -317,6 +420,9 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+ }
+ 
+ void GraphicsSystem::MarkVblank() {
++  if (pacing::Enabled()) {
++    pacing::Log("v %llu\n", (unsigned long long)pacing::Now());
++  }
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
+ 
 diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
 index 953c5fd4cff4f9b4bfac546fdbd06d03cd0994f4..3f8ca1b0aa853d353c675844bb5e1fb511cdb5e9 100644
 --- a/src/graphics/pipeline/render_target/cache.cpp
@@ -5807,6 +6106,28 @@ index a7d508a9e0db4742523689a8437d0cef98069dd3..db1407589958ef747e0d3deb07f668dc
      // Close the render target write check.
      a_.OpEndIf();
    }
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 1774f9703037ff340cd44cc86a693a835fc12e1c..13102aa41f6865dfd236b6bd93b71994bb276550 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -3493,6 +3493,17 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
+     index = builder_->createBinOp(spv::OpIAdd, type_int_, index,
+                                   builder_->makeIntConstant(int(storage_index)));
+   }
++  // A relative index can point outside the register file or the float
++  // constants (the Xbox 360 tolerates that). GPUs without hardware bounds
++  // checking (AMD through Metal: MoltenVK's robustBufferAccess is not real
++  // there) then read or overwrite other memory, and Tekken 6's main menu hung
++  // the GPU. Clamp to the array.
++  uint32_t array_size = is_float_constant ? constant_register_map.float_count : register_count();
++  if (array_size) {
++    index = builder_->createTriBuiltinCall(type_int_, ext_inst_glsl_std_450_, GLSLstd450SClamp,
++                                           index, const_int_0_,
++                                           builder_->makeIntConstant(int(array_size - 1)));
++  }
+   return index;
+ }
+ 
 diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
 index 9ce3bb4ad0c3d61c8880195fb3c96f666068d89b..47ab932c68bbebe63d3a02a0227077eb9a6b4057 100644
 --- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
@@ -9867,7 +10188,7 @@ index 305380e99599bf1e0fa5731d3bd32e0a7d9330e1..e86fe4c2ff0737b29447784fa444a305
        (rb_copy_dest_pitch.copy_dest_pitch + (xenos::kTextureTileWidthHeight - 1)) >>
        xenos::kTextureTileWidthHeightLog2;
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863c894c766 100644
+index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2e4555a55 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -13,6 +13,7 @@
@@ -9878,7 +10199,15 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
  #include <iterator>
  #include <mutex>
  #include <string>
-@@ -2272,6 +2273,8 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -23,6 +24,7 @@
+ 
+ #include <SPIRV/GlslangToSpv.h>
+ #include <glslang/Public/ShaderLang.h>
++#include <rex/pacing_log.h>
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+@@ -2272,6 +2274,8 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
  void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                         uint32_t frontbuffer_height) {
    SCOPE_profile_cpu_f("gpu");
@@ -9887,7 +10216,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
  
-@@ -2291,7 +2294,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2291,8 +2295,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
  
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
@@ -9895,9 +10224,13 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
 +                                            frame_used_async_placeholder_pipeline_ &&
 +                                            std::getenv("TEKKEN6_FORCE_PRESENT") == nullptr;
    if (skip_present_due_async_placeholder) {
++    if (pacing::Enabled()) {
++      pacing::Log("s %llu shader\n", (unsigned long long)pacing::Now());
++    }
      static bool skipped_incomplete_frame_logged = false;
      if (!skipped_incomplete_frame_logged) {
-@@ -3097,7 +3101,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+       skipped_incomplete_frame_logged = true;
+@@ -3097,7 +3105,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    if (use_dynamic_rendering) {
      if (in_render_pass_ && current_framebuffer_ == framebuffer &&
@@ -9907,7 +10240,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
        return;
      }
    } else {
-@@ -3117,6 +3122,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3117,6 +3126,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
    current_framebuffer_ = framebuffer;
@@ -9915,7 +10248,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
-@@ -3171,7 +3177,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3171,7 +3181,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    if (use_dynamic_rendering) {
      if (in_render_pass_ && current_framebuffer_ == framebuffer &&
@@ -9925,7 +10258,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
        return;
      }
    } else {
-@@ -3191,6 +3198,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3191,6 +3202,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
    current_framebuffer_ = framebuffer;
@@ -9933,7 +10266,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachment = {};
-@@ -3611,6 +3619,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3611,6 +3623,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    };
  
    xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
@@ -9941,7 +10274,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
    if (edram_mode == xenos::EdramMode::kCopy) {
      // Special copy handling.
      return IssueCopy();
-@@ -3679,8 +3688,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3679,8 +3692,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      }
      draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
    }
@@ -9950,7 +10283,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -3745,7 +3752,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3745,7 +3756,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
                                                     *pixel_shader, interpolator_mask,
                                                     ps_param_gen_pos, normalized_depth_control)
                                               : SpirvShaderTranslator::Modification(0);
@@ -9958,7 +10291,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
      // Translate the shaders now to obtain the sampler bindings.
      vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
-@@ -3829,6 +3835,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3829,6 +3839,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                     : 0;
  
@@ -9966,7 +10299,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
    // Update the textures before most other work in the submission because
    // samplers depend on this (and in case of sampler overflow in a submission,
    // submissions must be split) - may perform dispatches and copying.
-@@ -3894,6 +3901,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3894,6 +3905,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          descriptor_sets_kept = std::min(
              descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
        }
@@ -9975,7 +10308,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
      } else {
        // No or unknown pipeline layout previously bound - all bindings are in an
        // indeterminate state.
-@@ -4114,11 +4123,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4114,11 +4127,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    SubmitBarriersAndEnterRenderTargetCacheRenderPass(
        render_target_cache_->last_update_render_pass(),
        render_target_cache_->last_update_framebuffer());
@@ -9989,7 +10322,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,8 +4160,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,8 +4164,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -10000,7 +10333,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
    }
  
    // Invalidate textures in memexported memory and watch for changes.
-@@ -6559,32 +6569,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6559,32 +6573,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      sampler_count_pixel = 0;
      texture_count_pixel = 0;
    }
@@ -10035,7 +10368,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
      for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-@@ -6596,7 +6585,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6596,7 +6589,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
    size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
@@ -10044,7 +10377,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
           current_samplers_vertex_) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-@@ -6604,7 +6593,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6604,7 +6597,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
    size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
@@ -10053,7 +10386,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
      for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-@@ -6616,7 +6605,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6616,7 +6609,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
    size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
@@ -10062,7 +10395,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..718bebfe557f0a7ae21ecea5cbf33863
      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
           current_samplers_pixel_) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-@@ -6624,6 +6613,64 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6624,6 +6617,64 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
  
@@ -10218,7 +10551,7 @@ index b49e033bc127a7ce0270607b2925643b0b7aa2df..c5538e17842a74456e04d559d2d5f37c
    size_t arguments_size =
        rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
-index 91ac08f6c11d065793da02000b91057c73e2aa86..34f519f36212fb11f4497924ba7ada68c1f4aa86 100644
+index 91ac08f6c11d065793da02000b91057c73e2aa86..43f016760f71598055de65ab653d38fe9d8f771a 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/src/graphics/vulkan/pipeline_cache.cpp
 @@ -13,6 +13,8 @@
@@ -10265,7 +10598,71 @@ index 91ac08f6c11d065793da02000b91057c73e2aa86..34f519f36212fb11f4497924ba7ada68
    if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
      using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
      if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
-@@ -3214,6 +3230,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+@@ -1128,6 +1144,18 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   auto it = pipelines_.find(description);
+   if (it != pipelines_.end()) {
+     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
++    if (found_pipeline == VK_NULL_HANDLE &&
++        it->second.is_placeholder.load(std::memory_order_acquire)) {
++      // Still being created by a creation thread: the draw is skipped (see
++      // the placeholder check in the command processor) rather than waiting.
++      last_pipeline_ = &*it;
++      pipeline_out = VK_NULL_HANDLE;
++      pipeline_layout_out = nullptr;
++      if (pipeline_handle_out) {
++        *pipeline_handle_out = &it->second;
++      }
++      return true;
++    }
+     if (found_pipeline == VK_NULL_HANDLE) {
+       PipelineCreationArguments creation_arguments;
+       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
+@@ -1158,22 +1186,20 @@ bool VulkanPipelineCache::ConfigurePipeline(
+ 
+   bool queued_async_creation = false;
+   if (use_async) {
++    // Draws with a pipeline still being created are skipped by the command
++    // processor, so a placeholder pipeline (the real vertex shader with a
++    // stand-in pixel shader) would never be drawn with; creating one here
++    // compiled a vertex shader on the GPU command thread and stalled the game
++    // for up to a quarter of a second whenever new shaders appeared. Only
++    // queue the real pipeline.
+     creation_arguments_real.priority = async_priority;
+-    PipelineCreationArguments creation_arguments_placeholder;
+-    if (TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
+-                                                      creation_arguments_placeholder, true)) {
+-      pipeline.second.is_placeholder.store(true, std::memory_order_release);
+-      if (EnsurePipelineCreated(creation_arguments_placeholder, placeholder_pixel_shader_)) {
+-        {
+-          std::lock_guard<std::mutex> lock(creation_request_lock_);
+-          creation_queue_.push(creation_arguments_real);
+-        }
+-        creation_request_cond_.notify_one();
+-        queued_async_creation = true;
+-      } else {
+-        pipeline.second.is_placeholder.store(false, std::memory_order_release);
+-      }
++    pipeline.second.is_placeholder.store(true, std::memory_order_release);
++    {
++      std::lock_guard<std::mutex> lock(creation_request_lock_);
++      creation_queue_.push(creation_arguments_real);
+     }
++    creation_request_cond_.notify_one();
++    queued_async_creation = true;
+   }
+ 
+   if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
+@@ -1202,7 +1228,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   if (pipeline_handle_out) {
+     *pipeline_handle_out = &pipeline.second;
+   }
+-  return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
++  return queued_async_creation ||
++         (pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr);
+ }
+ 
+ bool VulkanPipelineCache::IsCreatingPipelines() const {
+@@ -3214,6 +3241,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
        return false;
    }
    input_assembly_state.primitiveRestartEnable = description.primitive_restart ? VK_TRUE : VK_FALSE;
@@ -10282,7 +10679,7 @@ index 91ac08f6c11d065793da02000b91057c73e2aa86..34f519f36212fb11f4497924ba7ada68
  
    VkPipelineViewportStateCreateInfo viewport_state;
    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-@@ -3480,7 +3506,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+@@ -3480,7 +3517,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
    VkPipeline pipeline;
@@ -10291,7 +10688,7 @@ index 91ac08f6c11d065793da02000b91057c73e2aa86..34f519f36212fb11f4497924ba7ada68
                                                           &pipeline_create_info, nullptr, &pipeline);
    if (create_result != VK_SUCCESS) {
      uint64_t ps_hash = creation_arguments.pixel_shader
-@@ -3517,6 +3543,114 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+@@ -3517,6 +3554,114 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
    return true;
  }
  
@@ -10406,6 +10803,24 @@ index 91ac08f6c11d065793da02000b91057c73e2aa86..34f519f36212fb11f4497924ba7ada68
  void VulkanPipelineCache::CreationThread(size_t thread_index) {
    while (true) {
      PipelineCreationArguments creation_arguments;
+@@ -3550,6 +3695,8 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+       } else {
+         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
+                                                            std::memory_order_release);
++        // No pipeline to wait for: let draws take the synchronous path again.
++        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
+       }
+     }
+ 
+@@ -3583,6 +3730,8 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
+       } else {
+         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
+                                                            std::memory_order_release);
++        // No pipeline to wait for: let draws take the synchronous path again.
++        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
+       }
+     }
+   }
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
 index 0298f0628f59f75c020936e69a1043778d908270..f4f90589f3023445632d8c3776f85d55d309f824 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
@@ -10574,34 +10989,6 @@ index 6788214140959ff171291ad9285c5b9725e688a0..f888265ad4867c950c03c75201234cc3
      upload_regions_.clear();
    }
    return successful;
-diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940d8fa4dac148808f8d88ca0dd1967b6e1c..d2907d600a0a2ba6d8ea82d285d1019a5c721dd9 100644
---- a/src/graphics/vulkan/texture_cache.cpp
-+++ b/src/graphics/vulkan/texture_cache.cpp
-@@ -12,6 +12,7 @@
- #include <algorithm>
- #include <array>
- #include <cstddef>
-+#include <cstdlib>
- #include <cstring>
- #include <utility>
- 
-@@ -3173,6 +3174,15 @@ bool VulkanTextureCache::Initialize() {
- const VulkanTextureCache::HostFormatPair& VulkanTextureCache::GetHostFormatPair(
-     TextureKey key) const {
-   const HostFormatPair& host_format_pair = host_formats_[uint32_t(key.format)];
-+  // Diagnostic A/B for the retail startup logo.  Its guest bytes are known
-+  // good, so route only this texture through the existing DXT1->RGBA8 path to
-+  // distinguish the direct BC1 upload from shader/rasterization problems.
-+  if (key.base_page == 0x10BC4 &&
-+      std::getenv("TEKKEN6_FORCE_LOGO_DXT1_RGBA") != nullptr &&
-+      (key.format == xenos::TextureFormat::k_DXT4_5 ||
-+       key.format == xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)) {
-+    return kHostFormatDXT4_5Unaligned;
-+  }
-   if (!host_format_pair.format_unsigned.block_compressed &&
-       !host_format_pair.format_signed.block_compressed) {
-     return host_format_pair;
 diff --git a/src/input/xinput/xinput_input_driver.cpp b/src/input/xinput/xinput_input_driver.cpp
 index a6a1da9ec3aaba1734f2e6b6e0ae65deba6f4879..45c242afa82b876e90f854c296fdb861aa8cb7cf 100644
 --- a/src/input/xinput/xinput_input_driver.cpp
@@ -10678,6 +11065,23 @@ index 31c53846384be172aaf78d985f6075ff552e2b47..bcadd43ccf6cd2ad03971bc81d128a9e
  REX_HOOK(rexcrt_memchr, rex::kernel::crt::native_memchr)
  REX_HOOK(rexcrt_XMemCpy, rex::kernel::crt::native_XMemCpy)
  REX_HOOK(rexcrt_XMemSet, rex::kernel::crt::native_XMemSet)
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index 8778066e8369026f9a3064fe156e43d8070f28fc..08134f4176e6a62aa5d9cad2a339b07eecce33e5 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -694,8 +694,11 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
+     return X_ERROR_INVALID_PARAMETER;
+   }
+ 
++  // There is no profile picture to read: give a fully transparent tile rather
++  // than an opaque white one (Tekken 6 shows the gamer picture beside the
++  // player's name in fights).
+   size_t size = size_t(stride) * size_t(height);
+-  std::memset(buffer_ptr, 0xFF, size);
++  std::memset(buffer_ptr, 0x00, size);
+ 
+   if (overlapped_ptr) {
+     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 index cce4f651a8f39c1f3e55a6f96e205d92f1344644..78cab4efc552387604cd74e7685dc2f52619dd15 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
@@ -11692,8 +12096,40 @@ index b94fe9e4814b7e66305d3b983732aebdfb0bced4..020fb58d412109dda15d48a527ef9fcf
      if (debug_overlay_) {
        debug_overlay_.reset();
      } else {
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4610dcc3e53946a84864e4b936af21d0f0..db6cf74275f64fd82eebb3b40d7d9755c47b3f19 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -201,6 +201,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   if (with_swapchain) {
+     // #2.
+     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
++    // #93, only for TEKKEN6_PACING_LOG display timestamps.
++    XE_UI_VULKAN_STRUCT_EXTENSION(GOOGLE_display_timing)
+   }
+ 
+   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
+diff --git a/src/ui/vulkan/vulkan_moltenvk.cpp b/src/ui/vulkan/vulkan_moltenvk.cpp
+index e2e2c163bec4b3aafc5ec04189aa39deb935a2dc..d1e83ecb9b9542e91fbe236633f10a7a39fd4d0a 100644
+--- a/src/ui/vulkan/vulkan_moltenvk.cpp
++++ b/src/ui/vulkan/vulkan_moltenvk.cpp
+@@ -207,6 +207,14 @@ void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths) {
+       setenv("VK_ICD_FILENAMES", moltenvk_icd.c_str(), 1);
+     }
+   }
++
++#if defined(__x86_64__)
++  // Intel Macs have AMD or Intel GPUs. With Metal argument buffers an AMD
++  // Radeon Pro 580 hits a GPU timeout as soon as Tekken 6 draws a textured
++  // character; binding resources directly works. Must be set before MoltenVK
++  // loads; an explicit setting still wins.
++  setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
++#endif
+ }
+ 
+ }  // namespace rex::ui::vulkan
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index 23645effaa5b659471aae7375b3b0fd48f41c35e..5acfdf100e5250d25019b6543439278b245f945d 100644
+index 23645effaa5b659471aae7375b3b0fd48f41c35e..4e51713833091cc4e735df2f429b531d3af0c3fe 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/src/ui/vulkan/vulkan_presenter.cpp
 @@ -11,6 +11,7 @@
@@ -11704,17 +12140,137 @@ index 23645effaa5b659471aae7375b3b0fd48f41c35e..5acfdf100e5250d25019b6543439278b
  #include <cstddef>
  #include <cstdint>
  #include <cmath>
-@@ -1529,6 +1530,9 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+@@ -23,6 +24,7 @@
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
++#include <rex/pacing_log.h>
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+@@ -49,6 +51,16 @@
+ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+                     "Clear render pass during presentation");
+ 
++#if defined(__APPLE__)
++#define REX_PRESENT_PACING_DEFAULT true
++#else
++#define REX_PRESENT_PACING_DEFAULT false
++#endif
++REXCVAR_DEFINE_BOOL(vulkan_present_pacing, REX_PRESENT_PACING_DEFAULT, "UI/Vulkan",
++                    "Keep guest frames in step with the display: lock the guest vblank rate to "
++                    "the display's refresh and move its phase so every frame reaches the screen "
++                    "at the same point of the refresh cycle (VK_GOOGLE_display_timing feedback)");
++
+ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
+                     "Allow immediate present mode (no vsync)");
+ 
+@@ -766,6 +778,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
+     bool surface_unusable;
++    ResetPresentPacingForNewSwapchain();
+     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
+         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
+         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
+@@ -870,6 +883,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+       return SurfacePaintConnectResult::kFailure;
+     }
+     bool surface_unusable;
++    ResetPresentPacingForNewSwapchain();
+     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
+         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
+         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
+@@ -1079,6 +1093,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
+   bool refresher_succeeded = refresher(context);
+   if (refresher_succeeded) {
+     image_instance.ever_successfully_refreshed = true;
++    if (pacing::Enabled()) {
++      pacing::Log("f %llu %llu\n", (unsigned long long)pacing::Now(),
++                  (unsigned long long)image_instance.version);
++    }
+   }
+   // Even if the refresher has returned false, it still might have submitted
+   // some commands referencing the image. It's better to put an excessive
+@@ -1528,7 +1546,77 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+   return true;
  }
  
++namespace {
++constexpr double kGuestFramePeriodNs = 1.0e9 / 60.0;
++
++}  // namespace
++
++// A new swapchain may be on another display, with another compositor timing:
++// calibrate again.
++void VulkanPresenter::ResetPresentPacingForNewSwapchain() {
++  present_pacing_steering_.store(false, std::memory_order_relaxed);
++  uint32_t next_present_id = present_pacing_.next_present_id;
++  present_pacing_ = PresentPacing();
++  present_pacing_.next_present_id = next_present_id;
++}
++
++// Returns whether pacing can be used for this present: the cvar is on, the
++// display timing extension is there and the display's refresh period is known.
++bool VulkanPresenter::UpdatePresentPacing(uint64_t now_ns) {
++  PresentPacing& pacing = present_pacing_;
++  if (!REXCVAR_GET(vulkan_present_pacing) ||
++      !vulkan_device_->extensions().ext_GOOGLE_display_timing) {
++    return false;
++  }
++  static PFN_vkGetRefreshCycleDurationGOOGLE get_refresh_cycle_duration =
++      reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(
++          vulkan_device_->vulkan_instance()->functions().vkGetDeviceProcAddr(
++              vulkan_device_->device(), "vkGetRefreshCycleDurationGOOGLE"));
++  if (!get_refresh_cycle_duration) {
++    return false;
++  }
++  // The window may move to a display with another refresh rate.
++  if (now_ns - pacing.nominal_checked_ns > 1000000000ull) {
++    pacing.nominal_checked_ns = now_ns;
++    VkRefreshCycleDurationGOOGLE refresh_cycle = {};
++    if (get_refresh_cycle_duration(vulkan_device_->device(), paint_context_.swapchain,
++                                   &refresh_cycle) == VK_SUCCESS &&
++        refresh_cycle.refreshDuration >= 2000000 && refresh_cycle.refreshDuration <= 50000000) {
++      uint64_t nominal = refresh_cycle.refreshDuration;
++      if (!pacing.nominal_refresh_ns ||
++          std::abs(double(nominal) - double(pacing.nominal_refresh_ns)) >
++              0.02 * double(pacing.nominal_refresh_ns)) {
++        uint32_t next_present_id = pacing.next_present_id;
++        pacing = PresentPacing();
++        present_pacing_steering_.store(false, std::memory_order_relaxed);
++        pacing.next_present_id = next_present_id;
++        pacing.nominal_checked_ns = now_ns;
++        pacing.nominal_refresh_ns = nominal;
++        // The guest frame period in display refreshes (one at 60 Hz, two at
++        // 120 Hz), refined later from display timestamps.
++        pacing.refresh_ns =
++            double(nominal) * std::max(1.0, std::round(kGuestFramePeriodNs / double(nominal)));
++        present_pacing_refresh_ns_.store(uint64_t(pacing.refresh_ns), std::memory_order_relaxed);
++      }
++    }
++  }
++  return pacing.refresh_ns > 0.0;
++}
++
  Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
++  // With present pacing, a repaint without a new guest frame would replace
++  // the newest guest frame while it waits for its refresh. While guest frames
++  // keep coming, the UI is drawn with them; repaints alone go through only
++  // when they've stopped (loading, pause).
++  const uint64_t pacing_now_ns = pacing::Now();
++  const bool pacing_active = UpdatePresentPacing(pacing_now_ns);
++  if (pacing_active && !IsNewGuestOutputReady() &&
++      pacing_now_ns - present_pacing_.last_new_frame_ns < 100000000ull) {
++    return PaintResult::kNotPresented;
++  }
 +  static std::atomic<uint64_t> paint_sequence{0};
 +  const uint64_t current_paint_sequence =
 +      paint_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
    // Begin the submission in place of the one not currently potentially used on
    // the GPU.
    uint64_t current_paint_submission_index =
-@@ -1631,13 +1635,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -1631,13 +1719,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
    GuestOutputProperties guest_output_properties;
    GuestOutputPaintConfig guest_output_paint_config;
    std::shared_ptr<GuestOutputImage> guest_output_image;
@@ -11731,7 +12287,186 @@ index 23645effaa5b659471aae7375b3b0fd48f41c35e..5acfdf100e5250d25019b6543439278b
      }
      // Incremented the reference count of the guest output image - safe to leave
      // the consumer critical section now as everything here either will be using
-@@ -2589,6 +2595,9 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffec
+@@ -2236,12 +2326,178 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   present_info.pSwapchains = &paint_context_.swapchain;
+   present_info.pImageIndices = &swapchain_image_index;
+   present_info.pResults = nullptr;
++  VkPresentTimesInfoGOOGLE present_times_info = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
++  VkPresentTimeGOOGLE present_time = {};
++  PresentPacing& pacing = present_pacing_;
++  const bool new_guest_frame =
++      guest_output_version != UINT64_MAX && guest_output_version != pacing.last_version;
++  if (new_guest_frame) {
++    pacing.last_version = guest_output_version;
++  }
++  if (vulkan_device_->extensions().ext_GOOGLE_display_timing &&
++      (REXCVAR_GET(vulkan_present_pacing) || pacing::Enabled())) {
++    const uint64_t now_ns = pacing::Now();
++    if (new_guest_frame) {
++      present_time.presentID = ++pacing.next_present_id;
++      if (!present_time.presentID) {
++        present_time.presentID = ++pacing.next_present_id;
++      }
++    }
++    if (new_guest_frame) {
++      pacing.last_new_frame_ns = now_ns;
++      pacing.presented_at_by_id[present_time.presentID % pacing.presented_at_by_id.size()] = now_ns;
++    }
++    if (present_time.presentID || present_time.desiredPresentTime) {
++      present_times_info.swapchainCount = 1;
++      present_times_info.pTimes = &present_time;
++      present_info.pNext = &present_times_info;
++    }
++    if (new_guest_frame && pacing::Enabled()) {
++      pacing::Log("p %llu %u %llu %llu\n", (unsigned long long)now_ns, present_time.presentID,
++                  (unsigned long long)guest_output_version,
++                  (unsigned long long)present_time.desiredPresentTime);
++    }
++  }
+   VkResult present_result;
+   {
+     const VulkanDevice::Queue::Acquisition queue_acquisition =
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+   }
++  // When earlier frames reached the display: the refresh grid and period to
++  // place targets on, and whether targets are being met.
++  if (vulkan_device_->extensions().ext_GOOGLE_display_timing &&
++      (REXCVAR_GET(vulkan_present_pacing) || pacing::Enabled())) {
++    static PFN_vkGetPastPresentationTimingGOOGLE get_past_timing =
++        reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(
++            vulkan_device_->vulkan_instance()->functions().vkGetDeviceProcAddr(
++                device, "vkGetPastPresentationTimingGOOGLE"));
++    if (get_past_timing) {
++      VkPastPresentationTimingGOOGLE timings[16];
++      uint32_t timing_count = uint32_t(rex::countof(timings));
++      if (get_past_timing(device, paint_context_.swapchain, &timing_count, timings) >= 0) {
++        for (uint32_t i = 0; i < timing_count; ++i) {
++          const VkPastPresentationTimingGOOGLE& timing = timings[i];
++          if (pacing::Enabled()) {
++            pacing::Log("d %u %llu %llu %llu\n", timing.presentID,
++                        (unsigned long long)timing.actualPresentTime,
++                        (unsigned long long)timing.earliestPresentTime,
++                        (unsigned long long)timing.presentMargin);
++          }
++          // Present ID 0 is a repaint of a frame already given an ID.
++          if (!timing.presentID || !timing.actualPresentTime || !pacing.nominal_refresh_ns) {
++            continue;
++          }
++          const uint64_t actual = timing.actualPresentTime;
++          const uint64_t presented_at =
++              pacing.presented_at_by_id[timing.presentID % pacing.presented_at_by_id.size()];
++          if (!presented_at || actual < presented_at + 2000000) {
++            // Never displayed (the window wasn't visible yet, or a newer frame
++            // replaced it): MoltenVK reports the time it was released.
++            continue;
++          }
++          if (pacing.last_shown_ns && timing.presentID > pacing.last_shown_id &&
++              actual > pacing.last_shown_ns) {
++            double delta = double(actual - pacing.last_shown_ns);
++            double refreshes = std::round(delta / pacing.refresh_ns);
++            if (refreshes >= 1.0 && refreshes <= 8.0) {
++              double sample = delta / refreshes;
++              if (std::abs(sample - pacing.refresh_ns) < 0.01 * pacing.refresh_ns) {
++                pacing.refresh_ns += (sample - pacing.refresh_ns) * 0.02;
++                present_pacing_refresh_ns_.store(uint64_t(pacing.refresh_ns),
++                                                 std::memory_order_relaxed);
++              }
++            }
++          }
++          pacing.last_shown_ns = actual;
++          pacing.last_shown_id = timing.presentID;
++          if (!pacing_active) {
++            continue;
++          }
++          // How long this frame waited from its present to the screen. With
++          // presents not synchronized to the display, the compositor takes
++          // the newest image at a fixed point of each refresh: a frame
++          // presented just before that point waits least, one just after
++          // waits a whole refresh more. When frames are presented close to
++          // that point, timing noise puts some on either side, and those are
++          // shown for two refreshes or skipped. Keep presents in the middle
++          // of the cycle, as far from that point as possible, by moving the
++          // guest vblank (and so when frames are made).
++          const double wait = double(actual - presented_at);
++          const double display_refresh = double(pacing.nominal_refresh_ns);
++          if (!pacing.calibrated) {
++            // Calibrate: slide the guest vblank later through a little more
++            // than one refresh, so frames are presented at every point of
++            // the cycle, and take the range of waits that gives.
++            pacing.wait_history[pacing.wait_history_count++] = wait;
++            present_pacing_shift_ns_.fetch_add(int64_t(display_refresh / 100.0),
++                                               std::memory_order_relaxed);
++            if (pacing.wait_history_count == pacing.wait_history.size()) {
++              std::array<double, 160> sorted = pacing.wait_history;
++              std::sort(sorted.begin(), sorted.end());
++              double low = sorted[sorted.size() * 3 / 100];
++              double high = sorted[sorted.size() * 97 / 100];
++              pacing.wait_history_count = 0;
++              const char* outcome = "again";
++              if (high - low > display_refresh * 0.6 && high - low < display_refresh * 1.4) {
++                pacing.calibrated = true;
++                pacing.steering = true;
++                present_pacing_steering_.store(true, std::memory_order_relaxed);
++                pacing.wait_middle_ns = (low + high) / 2;
++                outcome = "ok";
++              } else if (high - low < display_refresh * 0.5) {
++                // Waits barely change wherever in the cycle frames come: the
++                // display isn't taking images at fixed points, so there's
++                // nothing to keep away from.
++                pacing.calibrated = true;
++                pacing.steering = false;
++                present_pacing_steering_.store(false, std::memory_order_relaxed);
++                outcome = "flat";
++              }
++              pacing.frames_since_calibration = 0;
++              pacing.drift_ns = 0.0;
++              pacing.drift_frames = 0;
++              if (pacing::Enabled()) {
++                pacing::Log("c %llu low %.0f high %.0f %s\n", (unsigned long long)pacing::Now(),
++                            low, high, outcome);
++              }
++            }
++            continue;
++          }
++          if (!pacing.steering) {
++            if (++pacing.frames_since_calibration >= 1800) {
++              pacing.calibrated = false;
++            }
++            continue;
++          }
++          // Waiting longer than the middle: presented earlier in the cycle
++          // than needed, so make frames a little later, and the other way
++          // round.
++          double error = std::clamp(wait - pacing.wait_middle_ns, -display_refresh / 2,
++                                    display_refresh / 2);
++          double shift = error * 0.1;
++          present_pacing_shift_ns_.fetch_add(int64_t(shift), std::memory_order_relaxed);
++          pacing.drift_ns += shift;
++          if (++pacing.drift_frames >= 120) {
++            // Settled steering moves back and forth; two seconds of moving a
++            // whole refresh one way means it isn't settling, and every frame
++            // made later slows the game a little. Stop, and look again later.
++            if (std::abs(pacing.drift_ns) > display_refresh) {
++              pacing.steering = false;
++              present_pacing_steering_.store(false, std::memory_order_relaxed);
++              pacing.frames_since_calibration = 0;
++              if (pacing::Enabled()) {
++                pacing::Log("c %llu drifting %.0f flat\n", (unsigned long long)pacing::Now(),
++                            pacing.drift_ns);
++              }
++            }
++            pacing.drift_ns = 0.0;
++            pacing.drift_frames = 0;
++          }
++        }
++      }
++    }
++  }
+   switch (present_result) {
+     case VK_SUCCESS:
+       return PaintResult::kPresented;
+@@ -2589,6 +2845,9 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffec
    VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {};
    input_assembly_state.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
    input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;

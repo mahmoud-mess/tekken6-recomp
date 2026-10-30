@@ -9,6 +9,7 @@
 #   tools/run_mac.sh --log           # keep rexglue logging on (default: off, like Windows)
 #   tools/run_mac.sh --log-level trace  # trace|debug|info|warn|error (implies --log)
 #   tools/run_mac.sh --build-dir DIR
+#   tools/run_mac.sh --game DIR      # game files somewhere else (the folder with Default.xex); default game/
 # Keyboard acts as a controller (mnk_mode): Return/X=Start, Space=A, Backspace=B, L=X, P=Y,
 # WASD=left stick, Shift+arrows=d-pad, 1/3=shoulders, Q/E=triggers. F3 toggles the FPS overlay.
 # execute_unclipped_draw_vs_on_cpu restores Xenia's default (rexglue-sdk PR 513): without it,
@@ -23,6 +24,7 @@ cd "$root"
 arch="$(uname -m)"
 [[ "$arch" == arm64 ]] && platform=mac-arm64 || platform=mac-amd64
 build_dir="build/$platform"
+game_dir="$root/game"
 rt_path=fbo
 res=""
 offscreen=""
@@ -40,15 +42,16 @@ while (( $# )); do
     --log) log=info; shift ;;
     --log-level) log="$2"; shift 2 ;;
     --build-dir) build_dir="$2"; shift 2 ;;
+    --game) game_dir="${2:A}"; shift 2 ;;
     --) shift; extra=("$@"); break ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (use -- to pass host flags)" >&2; exit 1 ;;
   esac
 done
 
 host="$build_dir/tekken6"
 [[ -x "$host" ]] || { echo "missing $host; run tools/build_mac.sh first" >&2; exit 1; }
-[[ -f game/Default.xex || -f game/default.xex ]] || { echo "missing game/Default.xex" >&2; exit 1; }
+[[ -f "$game_dir/Default.xex" || -f "$game_dir/default.xex" ]] || { echo "missing $game_dir/Default.xex (use --game DIR)" >&2; exit 1; }
 
 mkdir -p user "cache/$rt_path" logs
 
@@ -60,13 +63,13 @@ log_file=/dev/null
 [[ "$log" != off ]] && log_file="logs/tekken6-$(date +%Y%m%d-%H%M%S).log"
 
 exec "$host" \
-  --game_data_root="$root/game" \
+  --game_data_root="$game_dir" \
   --user_data_root="$root/user" \
   --cache_root="$root/cache/$rt_path" \
   --fullscreen="$fullscreen" \
   --log_file="$log_file" --log_level="$log" \
   --gpu_backend=vulkan --render_target_path_vulkan="$rt_path" \
-  --async_shader_compilation=false --anisotropic_override=0 \
+  --async_shader_compilation=true --anisotropic_override=0 \
   --execute_unclipped_draw_vs_on_cpu=true \
   --mnk_mode=true \
   "${extra[@]}"

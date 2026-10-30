@@ -45,94 +45,81 @@ code uses FMA3 by default for faster explicit fused operations; the resulting
 executable requires an FMA3-capable CPU. Set `-DTEKKEN6_ENABLE_FMA3=OFF` for a
 portable build.
 
-## macOS build (Apple Silicon or Intel)
+## macOS
 
-macOS is a supported ReXGlue host platform: the Xenos GPU runs through the
-SDK's Vulkan backend on a pinned MoltenVK, windowing goes through SDL3/Cocoa,
-and the whole toolchain builds natively, so there is no cross-compiler step.
-The host-framebuffer (FBO) render path is the default on macOS: it renders
-fights correctly on Metal. The fragment shader interlock (FSI) path runs faster
-but shows stale EDRAM bands in resolved textures (floor reflections, menu
-blur) under MoltenVK, so it is opt-in. There is no D3D12 on macOS.
+### What you need
 
-Requirements: Xcode command line tools (AppleClang 16+), `brew install cmake ninja`.
+- A Mac with Apple Silicon and macOS 13.3 or later, or an Intel Mac with
+  macOS 15 or later
+- Your own disc image (`.iso`) of Tekken 6 for the Xbox 360, USA/Europe, Rev 1
+- About 20 GB of free space
+
+### Install
+
+1. Download `Tekken6-Builder-macOS-<version>.zip` from Releases, unzip it and open
+   `Tekken 6 Builder`.
+2. Click **Choose Disc Image** and pick your `.iso`. If it asks for Apple's
+   Command Line Tools, click **Install**, then **Try Again**.
+3. Wait for it to finish (a few minutes), then click **Open Tekken 6**.
+
+Tekken 6 is now in Applications. The game files, saves and shader cache are in
+`~/Library/Application Support/Tekken 6`, so you can delete the disc image.
+
+The first launch shows a black screen for 10 to 20 seconds while shaders are
+prepared.
+
+### Controls
+
+| Xbox 360 | Keyboard |
+|---|---|
+| Start | Return |
+| A, B, X, Y | Space, Backspace, L, P |
+| Left stick | W A S D |
+| D-pad | Shift + arrow keys |
+| LB, RB / LT, RT | 1, 3 / Q, E |
+
+In a fight, L, P, ; and ' are left punch, right punch, left kick and right
+kick. F3 shows the frame rate. Game controllers work too.
+
+### Using a game folder somewhere else
+
+To play from a game folder you already have (the one with `Default.xex`, on any
+drive), hold Option while opening Tekken 6 and choose it. The app remembers it.
+
+### Building from source
+
+Needs Apple's Command Line Tools and `brew install cmake ninja`.
 
 ```sh
-tools/build_mac.sh --iso /path/to/your/Tekken6.iso   # or --game /path/to/extracted
-tools/run_mac.sh                                      # host framebuffers (default)
-tools/run_mac.sh --fsi                                # interlock path (faster, stale bands)
-tools/run_mac.sh --res 768x432 --offscreen 512        # lighter internal targets
+tools/build_mac.sh --iso /path/to/Tekken6.iso   # add --arch x86_64 for Intel
+tools/make_mac_app.sh --install                  # puts Tekken 6.app in /Applications
 ```
 
-The script extracts the ISO into `game/`, builds the SDK and its codegen tool,
-generates guest code from your XEX, and links `build/mac-<arch>/tekken6` with
-`librexruntime`, the `librexgpu-xenos` plugin and a `vulkan/` folder holding the
-pinned Vulkan loader and MoltenVK next to it. Saves go to `user/`, shader
-caches to `cache/<path>/`. `tools/run_mac.sh --log` keeps logging on; pass host
-flags after `--`. FMA3 and SSSE3 flags only apply on x86-64 hosts; on arm64 the
-generated code's fused operations lower to NEON directly.
+`tools/run_mac.sh` starts it from the terminal: `--game DIR` for the game
+folder, `--fullscreen`, `--res 768x432` for a lower 3D resolution, `--log` to
+write a log to `logs/`. `tools/package_mac_builder.sh` makes the builder
+(`--sign` and `--notarize` for a Developer ID signed release).
 
-Three SDK bugs fixed in the carried patch were needed on a POSIX host: a lost
-wakeup in the signal-and-wait/auto-reset event emulation (the game hung on its
-first frame fence), a manual-reset SetEvent that did not release threads already
-waiting when a ResetEvent followed at once (the game's mutex-plus-event
-condition variables notify that way; Practice mode hung at character select
-two times in three), and the SPIR-V translator reading the texture-fetch
-exponent bias from the wrong fetch-constant word (every post-processed scene
-saturated to white; rexglue-sdk issue 456). After changing anything in the
-shader translator, delete `cache/` so stale translated shaders are not reused.
+### What changed for macOS
 
-One rendering bug needed no SDK change at all. Tekken clears depth every frame
-with unclipped draws under an 8192-high scissor; with the SDK's default
-`execute_unclipped_draw_vs_on_cpu=false` (Xenia's default is true, see
-rexglue-sdk PR 513) the render target cache sizes those claims from the
-scissor, so a tiny target at the end of EDRAM claims all of it, wraps past
-tile 2047 and takes over the scene colour buffer at tile 0. The contents then
-round-trip through a 4x MSAA depth target and come back black: Practice mode
-showed only the HUD, and fights flashed black between attacks. `run_mac.sh`
-passes `--execute_unclipped_draw_vs_on_cpu=true`, which sizes the claims from
-the actual vertices, and the scene is intact on both paths.
+All in the [SDK patch](patches/rexglue/README.md):
 
-For hangs: run with `REX_DEBUG_DUMP_TRIGGER=/some/path` in the environment and
-create that file while the game is stuck. The runtime prints every event,
-mutex and semaphore with its host state and what each guest thread is waiting
-on, to stderr and the log.
+- Fixed two timing bugs in the Xbox event emulation that froze the first frame.
+- Converts a primitive type Metal can't draw.
+- Fixed a shader converter value that washed every scene out white.
+- Groups graphics work into fewer passes (M1 Max: 21 fps before, 60 after).
+- Paces frames evenly to the display (`--vulkan_present_pacing=false` turns it
+  off).
+- Intel Macs don't use Metal argument buffers, which hung the AMD GPU.
+- Removed the white square where the Xbox shows the gamer picture.
 
-Rendering notes specific to MoltenVK: Metal cannot disable primitive restart
-for strip topologies and MoltenVK fails pipeline creation when asked to, which
-silently drops those draws (a black 3D scene behind a working HUD). The carried
-patch forces restart on for strip pipelines on Apple, in both the guest pipeline
-cache and the presentation pipeline. Keep the integer ownership-transfer formats:
-without them the SDK decides transfers cannot be bit-exact and switches to the
-FSI path on its own. The `window_high_pixel_density` cvar can be set to `false`
-to present at 1x on a Retina display. The first run with an empty `cache/` looks
-frozen or black for 10-20 s while shaders compile.
+Intel needs macOS 15 because the macOS 13 AMD driver draws the game's motion
+blur wrong and the characters come out black.
 
-Performance on Apple Silicon is limited by render pass count, not pixels:
-lowering the internal resolution changes nothing. Every Metal render pass on
-a tile-based GPU loads and stores its attachments, and the SDK used to end the
-open pass for each upload of guest memory that changed since the last draw
-(vertex data, mostly), then restart it. In a fight that cut the shadow-map
-pass into about 25 pieces and the scene pass into about 45, roughly 125 render
-passes a frame. The carried patch records such an upload ahead of the open
-pass instead whenever no draw already in that pass reads the uploaded pages,
-which leaves about 56 passes a frame. `--vulkan_hoist_uploads=false` restores
-the old behaviour for comparison.
-
-Measured on an M1 Max with the game's own count of frames that reach the
-screen (the F3 overlay counts frames drawn, which overstates it), 90 s of
-random input in Practice on City After Dark and in an Arcade fight, one run
-each: about 21 frames shown per second before, with as many drawn and
-dropped, and about 60 after. A Metal System Trace with the change puts the GPU
-at about 10.5 ms of the 16.7 ms frame in that Practice fight. Heavier moments
-still come close to the budget, so an occasional dropped frame remains. An M5
-Max runs fights at a locked 60 either way. Measure with the screen unlocked,
-nothing else heavy running, and the full-power charger: an M1 Max on a small
-charger drains and throttles under this load.
-
-The Intel build compiles and starts, but on an AMD Radeon Pro 580 (macOS 13)
-the GPU hangs about half a minute in, at the main menu, with or without the
-changes above; that is still open.
+For developers: `--execute_unclipped_draw_vs_on_cpu=true` (set by the launchers)
+is needed for Practice mode and fights to render. After changing the shader
+converter, delete `cache/`. If the game hangs, set `REX_DEBUG_DUMP_TRIGGER=/some/file`
+and create that file to print what every thread is waiting on.
 
 ## Portable ISO builder
 
