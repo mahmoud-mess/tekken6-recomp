@@ -5,8 +5,11 @@ The SDK submodule uses the public upstream tag `nightly-20260904-0c7b01a0`
 `0001-tekken6-runtime.patch` contains the title's runtime compatibility,
 rendering, ROV specialization and crash-report support. Linux additions preserve
 sub-millisecond POSIX wait durations (avoiding busy polling) and add the optional
-`guest_frame_limit` setting. The Linux launcher uses a 60 FPS swap cap with guest
-vsync disabled to avoid the observed missed-vblank slowdown.
+`guest_frame_limit` setting. The Linux launcher uses fast GPU wait polling with
+an independent 60 Hz guest vblank clock. Linux memory protection queries
+optionally use PROCMAP_QUERY on
+supported kernels, with a legacy parser fallback. These changes were tested in
+Scenario Campaign to restore scenery, near-60 FPS gameplay, and normal cutscenes.
 
 From the project root:
 

@@ -68,7 +68,7 @@ exec "$here/tools/run_linux.sh" --build-dir "$here/bin" "$@"
         'Move this entire folder together. Saves/cache stay inside it.\n'
         'Requires compatible Linux system libraries and a working Vulkan driver.\n'
         'Tested on Ubuntu 24.04-based Zorin OS 18.1.\n'
-        'Scenario Campaign is a known failing mode; some stages run below 60 FPS.\n')
+        'Scenario Campaign has been tested in one stage; some stages may run below 60 FPS.\n')
     manifest = {'version': (ROOT / 'VERSION.txt').read_text().strip(),
                 'binary_sha256': {name: hashlib.sha256((output / 'bin' / name).read_bytes()).hexdigest()
                                   for name in BINARIES}}

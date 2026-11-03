@@ -1527,6 +1527,75 @@ index 1c735482a227d52375793f3dac1f9c04d1062b53..d0876f8e61f769282c2374290cf84b34
  
    if (result.blocks.empty()) {
      REXCODEGEN_WARN("Analyze: no blocks found for function 0x{:08X}", funcAddr);
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39c927a03b6b03c4ede083adc5b0ae50809..2da3b704ead3a25388efed144c1458d8d2fdadb0 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -9,8 +9,11 @@
+  * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
+  */
+ 
++#include <atomic>
+ #include <cerrno>
++#include <cstdlib>
+ #include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+ #include <fstream>
+@@ -25,6 +28,7 @@
+ #include <mach/vm_region.h>
+ #endif  // REX_PLATFORM_MAC
+ 
++#include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -173,6 +177,44 @@ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
+ // Find the mapping entry in /proc/self/maps that contains the given address
+ static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
+   const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
++  // Linux 6.11+ can query one VMA directly rather than formatting and parsing
++  // the entire map list inside every guest write-watch signal handler. Keep
++  // the stable UAPI layout here so builds with older distro headers benefit
++  // on new kernels too. See include/uapi/linux/fs.h, struct procmap_query.
++  struct ProcMapQuery {
++    uint64_t size, flags, address, start, end, access, page_size, offset, inode;
++    uint32_t dev_major, dev_minor, name_size, build_id_size;
++    uint64_t name_address, build_id_address;
++  };
++  static_assert(sizeof(ProcMapQuery) == 104);
++  static std::atomic<bool> direct_query_supported{true};
++  static const bool legacy_query = std::getenv("REX_LINUX_FAST_MAP_QUERY") == nullptr ||
++                                   std::getenv("REX_LINUX_LEGACY_MAP_QUERY") != nullptr;
++  if (!legacy_query && direct_query_supported.load(std::memory_order_relaxed)) {
++    // Open per query: no stale descriptor after fork, and no fd lifetime or
++    // shared file-position synchronization is required between fault handlers.
++    const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
++    if (fd >= 0) {
++      ProcMapQuery query{};
++      query.size = sizeof(query);
++      query.address = addr;
++      const int result = ioctl(fd, _IOWR('f', 17, ProcMapQuery), &query);
++      const int error = errno;
++      close(fd);
++      if (result == 0) {
++        out_entry = LinuxMapEntry{};
++        out_entry.start = query.start;
++        out_entry.end = query.end;
++        out_entry.perms[0] = (query.access & 1) ? 'r' : '-';
++        out_entry.perms[1] = (query.access & 2) ? 'w' : '-';
++        out_entry.perms[2] = (query.access & 4) ? 'x' : '-';
++        return query.start <= addr && addr < query.end;
++      }
++      if (error == ENOENT) return false;  // Address is not mapped.
++      if (error == ENOTTY || error == EINVAL || error == ENOSYS || error == EOPNOTSUPP)
++        direct_query_supported.store(false, std::memory_order_relaxed);
++    }
++  }
+   std::ifstream maps("/proc/self/maps");
+   if (!maps.is_open())
+     return false;
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
 index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..66f0c795cccca05bb13c5819f2def5639915328d 100644
 --- a/src/core/threading_posix.cpp
@@ -2942,7 +3011,7 @@ index 2be0e8eec88a419b06ad34354ae738a0c286b87f..5572b8c3bab48665a14dcbfc5944a5f9
    ID3D12Device* device = provider.GetDevice();
    // Assuming untiling will be the next operation.
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..6b54e01154bd94ceca6b6df96aac59f4348b2ba3 100644
+index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..6c8f0d471ecd1846005f87417345377aae44d786 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -9,11 +9,21 @@
@@ -2967,7 +3036,19 @@ index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..6b54e01154bd94ceca6b6df96aac59f4
  #include <functional>
  #include <memory>
  #include <mutex>
-@@ -150,6 +160,28 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -31,6 +41,11 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++REXCVAR_DEFINE_INT32(guest_vblank_hz, 0, "GPU",
++                    "Override guest vblank frequency independently of GPU wait pacing; 0 uses vsync defaults")
++    .range(0, 1000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -150,6 +165,28 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
    vsync_worker_running_ = true;
    vsync_worker_thread_ = system::object_ref<system::XHostThread>(
        new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
@@ -2996,7 +3077,7 @@ index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..6b54e01154bd94ceca6b6df96aac59f4
          system::X_VIDEO_MODE video_mode;
          kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
          double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
-@@ -157,16 +189,52 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -157,16 +194,54 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
          uint64_t vsync_interval_ticks =
              std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
          uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
@@ -3017,12 +3098,14 @@ index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..6b54e01154bd94ceca6b6df96aac59f4
 +        };
 +        uint64_t next_vblank = chrono::Clock::QueryGuestTickCount() + vsync_interval_ticks;
          while (vsync_worker_running_) {
--          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-           uint64_t interval_ticks =
++          const int32_t forced_vblank_hz = REXCVAR_GET(guest_vblank_hz);
++          uint64_t interval_ticks = forced_vblank_hz > 0
++              ? std::max(uint64_t(1), guest_tick_frequency / uint64_t(forced_vblank_hz))
++              : (REXCVAR_GET(vsync) ? vblank_interval_ticks() : no_vsync_interval_ticks);
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+-          uint64_t interval_ticks =
 -              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
 -          while (current_time - last_frame_time >= interval_ticks) {
-+              REXCVAR_GET(vsync) ? vblank_interval_ticks() : no_vsync_interval_ticks;
-+          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
 +          if (current_time >= next_vblank) {
              MarkVblank();
 -            last_frame_time += interval_ticks;
@@ -3055,7 +3138,7 @@ index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..6b54e01154bd94ceca6b6df96aac59f4
          }
          return 0;
        }));
-@@ -203,6 +271,41 @@ void GraphicsSystem::Shutdown() {
+@@ -203,6 +278,41 @@ void GraphicsSystem::Shutdown() {
    provider_.reset();
  }
  
@@ -3097,7 +3180,7 @@ index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..6b54e01154bd94ceca6b6df96aac59f4
  void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_responsible) {
    // TODO(Triang3l): Somehow gain exclusive ownership of the Provider (may be
    // used by the command processor, the presenter, and possibly anything else,
-@@ -317,6 +420,9 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+@@ -317,6 +427,9 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
  }
  
  void GraphicsSystem::MarkVblank() {

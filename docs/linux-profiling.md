@@ -58,6 +58,11 @@ uninstrumented baseline and retain raw data, settings and binary hashes.
 Practice, RX 580 2048SP / Mesa RADV 25.2.8, Ryzen 5 5500, original internal
 1024×576 and offscreen 1024×1024, Vulkan framebuffer, FIFO, 60 FPS swap cap.
 These are single approximately 20-second samples, not repeated benchmarks.
+They predate the [Campaign timing and memory-query fix](scenario-campaign.md):
+that baseline used a 1000 Hz guest clock and the legacy maps parser. The current
+launcher instead uses a 60 Hz guest clock, no extra swap cap, and direct mapping
+queries on supported kernels. Capture again before comparing current performance
+against these historical measurements.
 
 | Per-frame metric (mean) | Tunnel Disaster | Lightning Storm |
 |---|---:|---:|
@@ -85,11 +90,12 @@ not exclude GPU queueing, driver waits, memory bandwidth or stage-specific guest
 work. Stack profiles identify shared-memory upload/memcpy and descriptor updates;
 these also occur on the faster stage and are not yet proven causes.
 
-Next: split draw wall time among render-target updates, pipeline configuration,
-texture/binding updates and primitive processing; pair it with per-thread CPU
-time or off-CPU stacks. Test a single optimization only after identifying which
-section explains the extra latency. Forest/water and snow still need matching
-instrumented captures. Scenario Campaign's missing scenery/stall is separate.
+Follow-up Campaign profiling identified expensive memory-protection queries
+under a shared runtime lock. The direct-query path and corrected guest clock
+restored the reproduced Campaign stage and improved the player's Practice stage
+checks. Repeat these captures with the current settings before investigating
+remaining draw/upload latency. Forest/water and snow still need matching
+instrumented captures.
 
 Raw local captures and additional CPU profiles are in `.local-tests/profiling/`.
 They are ignored by Git. The baseline comparison is in that directory's

@@ -79,10 +79,11 @@ shader interlock and requires driver/device support for that feature. Use
 the table below, and game controllers use SDL3. Saves go in `user/`, shader
 caches in `cache/linux-fbo` or `cache/linux-fsi`, and optional logs in `logs/`.
 
-The Linux launcher bypasses guest vblank gating, caps actual guest swaps at
-60 FPS, and uses FIFO presentation. This avoids the 40–45 FPS slowdown seen
-with the SDK's original timing while keeping gameplay at normal speed on
-high-refresh displays. `--legacy-timing` restores the SDK timing for comparison.
+The Linux launcher keeps guest vblank at 60 Hz, uses fast GPU wait polling and
+FIFO presentation, and enables direct Linux memory-mapping queries where the
+kernel supports them. It does not add a separate guest swap limiter: the extra
+limiter can interact poorly with the game's own pacing. `--legacy-timing`
+restores the SDK's original timing for comparison.
 
 Initial testing on Zorin OS 18.1 (Ubuntu 24.04 base), Clang 19, RX 580 2048SP,
 and Mesa RADV 25.2.8 confirmed Practice mode near 60 FPS at the original internal
@@ -91,13 +92,29 @@ alone did not fix the original slowdown. This is an initial gameplay check,
 not full coverage of all stages or modes. Stage testing also found 59–60 FPS
 on Tunnel Disaster, 57–59 on Electric Fountain, 45–50 on the forest/water stage,
 and 45–48 on Lightning Storm. The snow stage also slows during gameplay, with
-FPS rising in the pause menu. These are player observations, not controlled
-benchmarks; stage-specific performance still needs profiling.
+FPS rising in the pause menu. These observations used the earlier timing and
+memory-query settings. With the updated settings below, the user reported
+steady 60 FPS in Practice, including the storm stage and Mystical Forest.
+These are player observations, not controlled benchmarks.
 
-Scenario Campaign entered gameplay
-with missing scenery and stalled in one test; it remains a known failing case.
+Scenario Campaign initially loaded with missing scenery and nearly stopped.
+The updated guest-clock and memory-query settings were then tested in the same
+stage: scenery rendered, gameplay ran near 60 FPS, and cutscenes played at normal
+speed. This is a tested stage, not validation of the entire campaign.
+See [the Campaign investigation](docs/scenario-campaign.md) for details.
 The interlock path selected llvmpipe (software rendering) on this machine, so
 it is not a tested hardware alternative for this GPU.
+
+Linux 6.11+ supplies the direct `PROCMAP_QUERY` ioctl; older kernels fall back
+to the original `/proc/self/maps` parser. Set `REX_LINUX_LEGACY_MAP_QUERY=1` when
+launching to compare the parser path. The protection-query regression/benchmark
+can be run with:
+
+```sh
+cmake --build build/linux-amd64 --target tekken6_linux_memory_test
+build/linux-amd64/tekken6_linux_memory_test
+REX_LINUX_FAST_MAP_QUERY=1 build/linux-amd64/tekken6_linux_memory_test
+```
 
 The SDK patch also fixes CPU spinning during the final fraction of a timed
 POSIX wait. Its Linux regression check covers timeouts, wait-any, wait-all,
