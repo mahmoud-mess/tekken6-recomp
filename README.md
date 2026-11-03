@@ -108,6 +108,26 @@ cmake --build build/linux-amd64 --target tekken6_linux_wait_test
 build/linux-amd64/tekken6_linux_wait_test
 ```
 
+### Standalone Linux app folder
+
+Create or update the app folder yourself with one command:
+
+```sh
+python3 tools/package_linux.py
+```
+
+This creates `build/Tekken6-Linux/Play.sh` together with the executable, required
+ReXGlue libraries, launcher, and your extracted game data. Move the complete
+folder and run `./Play.sh`. No compiler or SDK is needed to play; the destination
+still needs compatible Linux libraries and a Vulkan driver.
+
+Use `--build` to rebuild before packaging, `--output DIR` for another destination,
+and `--include-saves` to copy current saves on the first packaging. Re-running
+reuses unchanged game files and preserves existing packaged saves and caches.
+
+Developer profiling instructions and initial CPU/GPU measurements are in
+[Linux profiling](docs/linux-profiling.md).
+
 ## macOS
 
 ### What you need

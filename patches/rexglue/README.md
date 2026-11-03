@@ -28,3 +28,6 @@ Keep the submodule revision pinned to the upstream tag. Its applied working-tree
 changes are excluded from the parent repository's status; the patch is the
 versioned source of those changes. The helper checks the base revision and
 refuses to overwrite an SDK with conflicting edits.
+
+Optional Vulkan counters and asynchronous submission timestamps are enabled by
+`TEKKEN6_GPU_PROFILE`; see [Linux profiling](../../docs/linux-profiling.md).

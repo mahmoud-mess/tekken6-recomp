@@ -519,10 +519,86 @@ index 3da182d480afc78df231f643238b9061a10f1e6a..89f53f0139be76b37d930eb68aa2e30c
    // copy_dest_extent_length may be zero if something is wrong with the
    // destination, in this case, clearing may still be done, but copying must be
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff481c12369287f7c8096cba8daf15b50c68c..3c5964fed7f3022fb4dd8cdfc28ce69f241900c6 100644
+index 696ff481c12369287f7c8096cba8daf15b50c68c..efaab7f9403730528e84fa4f483bb393500262fd 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -788,11 +788,25 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -11,6 +11,9 @@
+  */
+ 
+ #include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <climits>
+ #include <cstdint>
+ #include <deque>
+@@ -47,6 +50,51 @@ namespace rex::graphics::vulkan {
+ 
+ class VulkanCommandProcessor : public CommandProcessor {
+  public:
++  // Opt-in, GPU-command-thread-only instrumentation. No extra GPU waits.
++  struct Profile {
++    FILE* file = nullptr;
++    uint64_t frame = 0, draws = 0, draw_ns = 0, upload_bytes = 0,
++             upload_ranges = 0, copies = 0, hoisted_bytes = 0, upload_ns = 0,
++             pass_ends = 0, submits = 0, fence_ns = 0, submit_ns = 0;
++    bool timestamp_checked = false, timestamp_allocation_failed = false;
++    float timestamp_period = 0;
++    uint32_t timestamp_bits = 0;
++    static uint64_t Now() {
++      return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++          std::chrono::steady_clock::now().time_since_epoch()).count());
++    }
++    Profile() {
++      const char* path = std::getenv("TEKKEN6_GPU_PROFILE");
++      if (path && *path) file = std::fopen(path, "w");
++      if (file) std::fprintf(file,
++          "# F,time_ns,frame,draw_attempts,draw_cpu_ns,upload_bytes,upload_ranges,copy_commands,hoisted_bytes,upload_cpu_ns,pass_ends,submits,fence_wait_ns,queue_submit_cpu_ns\n"
++          "# G,time_ns,frame,submission,gpu_span_ns\n");
++    }
++    ~Profile() { if (file) std::fclose(file); }
++    struct Timer {
++      uint64_t& total;
++      uint64_t start;
++      Timer(uint64_t& value, bool enabled) : total(value), start(enabled ? Now() : 0) {}
++      ~Timer() { if (start) total += Now() - start; }
++    };
++    void EndFrame() {
++      if (!file) return;
++      std::fprintf(file, "F,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
++          (unsigned long long)Now(), (unsigned long long)frame,
++          (unsigned long long)draws, (unsigned long long)draw_ns,
++          (unsigned long long)upload_bytes, (unsigned long long)upload_ranges,
++          (unsigned long long)copies, (unsigned long long)hoisted_bytes,
++          (unsigned long long)upload_ns, (unsigned long long)pass_ends,
++          (unsigned long long)submits, (unsigned long long)fence_ns,
++          (unsigned long long)submit_ns);
++      std::fflush(file);
++      ++frame;
++      draws = draw_ns = upload_bytes = upload_ranges = copies = hoisted_bytes =
++          upload_ns = pass_ends = submits = fence_ns = submit_ns = 0;
++    }
++  };
++  Profile& profile() { return profile_; }
++
+   // Single-descriptor layouts for use within a single frame.
+   enum class SingleTransientDescriptorLayout {
+     kStorageBufferCompute,
+@@ -268,9 +316,13 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool IssueCopy() override;
+ 
+  private:
++  Profile profile_;
+   struct CommandBuffer {
+     VkCommandPool pool;
+     VkCommandBuffer buffer;
++    VkQueryPool profile_queries = VK_NULL_HANDLE;
++    uint64_t profile_frame = 0;
++
+   };
+ 
+   struct SparseBufferBind {
+@@ -788,11 +840,25 @@ class VulkanCommandProcessor : public CommandProcessor {
    std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
    std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
  
@@ -1057,7 +1133,7 @@ index 947817feb0a934206d542f28f77ac69b8651dd9c..f6b5cf0096e8560d2cf4e8a702db3a6b
      bool ext_EXT_shader_stencil_export = false;         // #141
      bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
 diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
-index aa55a4a284d966b2de2251a2c7aa595c741ca046..54a59f7846de997885a1ff249444a3955922b262 100644
+index aa55a4a284d966b2de2251a2c7aa595c741ca046..06333c9ef5ec7ae6dba6db244388a9fcc63591c8 100644
 --- a/include/rex/ui/vulkan/functions/device_1_0.inc
 +++ b/include/rex/ui/vulkan/functions/device_1_0.inc
 @@ -40,6 +40,10 @@ XE_UI_VULKAN_FUNCTION(vkCreateDescriptorPool)
@@ -1071,6 +1147,13 @@ index aa55a4a284d966b2de2251a2c7aa595c741ca046..54a59f7846de997885a1ff249444a395
  XE_UI_VULKAN_FUNCTION(vkCreateGraphicsPipelines)
  XE_UI_VULKAN_FUNCTION(vkCreateImage)
  XE_UI_VULKAN_FUNCTION(vkCreateImageView)
+@@ -82,3 +86,6 @@ XE_UI_VULKAN_FUNCTION(vkQueueSubmit)
+ XE_UI_VULKAN_FUNCTION(vkUnmapMemory)
+ XE_UI_VULKAN_FUNCTION(vkUpdateDescriptorSets)
+ XE_UI_VULKAN_FUNCTION(vkWaitForFences)
++
++XE_UI_VULKAN_FUNCTION(vkCmdWriteTimestamp)
++XE_UI_VULKAN_FUNCTION(vkGetQueryPoolResults)
 diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
 index 56ee43bf7981cfdf7841b3ba1c14f862f54a49f5..46475c03ae09e2cc50a095120943b87455643118 100644
 --- a/include/rex/ui/vulkan/presenter.h
@@ -10255,7 +10338,7 @@ index 305380e99599bf1e0fa5731d3bd32e0a7d9330e1..e86fe4c2ff0737b29447784fa444a305
        (rb_copy_dest_pitch.copy_dest_pitch + (xenos::kTextureTileWidthHeight - 1)) >>
        xenos::kTextureTileWidthHeightLog2;
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2e4555a55 100644
+index 001f36b9824fa575468fe96615020cd3a9ab1a76..8f8f696542a09d0bed601cf7db42a94c06e7254d 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -13,6 +13,7 @@
@@ -10274,7 +10357,24 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
  #include <rex/assert.h>
  #include <rex/cvar.h>
  #include <rex/dbg.h>
-@@ -2272,6 +2274,8 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -2059,11 +2061,15 @@ void VulkanCommandProcessor::ShutdownContext() {
+ 
+   deferred_command_buffer_.Reset();
+   for (const auto& command_buffer_pair : command_buffers_submitted_) {
++    if (command_buffer_pair.second.profile_queries != VK_NULL_HANDLE)
++      dfn.vkDestroyQueryPool(device, command_buffer_pair.second.profile_queries, nullptr);
+     dfn.vkDestroyCommandPool(device, command_buffer_pair.second.pool, nullptr);
+   }
+   command_buffers_submitted_.clear();
+   for (const CommandBuffer& command_buffer : command_buffers_writable_) {
+-    dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
++    if (command_buffer.profile_queries != VK_NULL_HANDLE)
++          dfn.vkDestroyQueryPool(device, command_buffer.profile_queries, nullptr);
++      dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
+   }
+   command_buffers_writable_.clear();
+ 
+@@ -2272,6 +2278,8 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
  void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                         uint32_t frontbuffer_height) {
    SCOPE_profile_cpu_f("gpu");
@@ -10283,7 +10383,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
  
-@@ -2291,8 +2295,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2291,8 +2299,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
  
    bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                              REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
@@ -10297,7 +10397,17 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
      static bool skipped_incomplete_frame_logged = false;
      if (!skipped_incomplete_frame_logged) {
        skipped_incomplete_frame_logged = true;
-@@ -3097,7 +3105,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -2905,7 +2917,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+               uint32_t(swap_descriptor_sets.size()), swap_descriptor_sets.data(), 0, nullptr);
+ 
+           deferred_command_buffer_.CmdVkDraw(3, 1, 0, 0);
+-          deferred_command_buffer_.CmdVkEndRenderPass();
++          if (profile_.file) ++profile_.pass_ends;
++    deferred_command_buffer_.CmdVkEndRenderPass();
+ 
+           // Insert the release barrier.
+           PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
+@@ -3097,7 +3110,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    if (use_dynamic_rendering) {
      if (in_render_pass_ && current_framebuffer_ == framebuffer &&
@@ -10307,7 +10417,20 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
        return;
      }
    } else {
-@@ -3117,6 +3126,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3108,15 +3122,18 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   if (in_render_pass_) {
+     if (use_dynamic_rendering) {
+-      deferred_command_buffer_.CmdVkEndRendering();
++      if (profile_.file) ++profile_.pass_ends;
++    deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+-      deferred_command_buffer_.CmdVkEndRenderPass();
++      if (profile_.file) ++profile_.pass_ends;
++    deferred_command_buffer_.CmdVkEndRenderPass();
+     }
+     in_render_pass_ = false;
+   }
  
    current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
    current_framebuffer_ = framebuffer;
@@ -10315,7 +10438,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
-@@ -3171,7 +3181,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3171,7 +3188,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
    if (use_dynamic_rendering) {
      if (in_render_pass_ && current_framebuffer_ == framebuffer &&
@@ -10325,7 +10448,20 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
        return;
      }
    } else {
-@@ -3191,6 +3202,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3182,15 +3200,18 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   if (in_render_pass_) {
+     if (use_dynamic_rendering) {
+-      deferred_command_buffer_.CmdVkEndRendering();
++      if (profile_.file) ++profile_.pass_ends;
++    deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+-      deferred_command_buffer_.CmdVkEndRenderPass();
++      if (profile_.file) ++profile_.pass_ends;
++    deferred_command_buffer_.CmdVkEndRenderPass();
+     }
+     in_render_pass_ = false;
+   }
  
    current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
    current_framebuffer_ = framebuffer;
@@ -10333,7 +10469,27 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
  
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachment = {};
-@@ -3611,6 +3623,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3259,8 +3280,10 @@ void VulkanCommandProcessor::EndRenderPass() {
+     return;
+   }
+   if (current_render_pass_ == VK_NULL_HANDLE) {
++    if (profile_.file) ++profile_.pass_ends;
+     deferred_command_buffer_.CmdVkEndRendering();
+   } else {
++    if (profile_.file) ++profile_.pass_ends;
+     deferred_command_buffer_.CmdVkEndRenderPass();
+   }
+   current_render_pass_ = VK_NULL_HANDLE;
+@@ -3590,6 +3613,8 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
++  Profile::Timer draw_timer(profile_.draw_ns, profile_.file != nullptr);
++  if (profile_.file) ++profile_.draws;
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -3611,6 +3636,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    };
  
    xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
@@ -10341,7 +10497,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
    if (edram_mode == xenos::EdramMode::kCopy) {
      // Special copy handling.
      return IssueCopy();
-@@ -3679,8 +3692,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3679,8 +3705,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
      }
      draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
    }
@@ -10350,7 +10506,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
    uint32_t ps_param_gen_pos = UINT32_MAX;
    uint32_t interpolator_mask =
        pixel_shader ? (vertex_shader->writes_interpolators() &
-@@ -3745,7 +3756,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3745,7 +3769,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
                                                     *pixel_shader, interpolator_mask,
                                                     ps_param_gen_pos, normalized_depth_control)
                                               : SpirvShaderTranslator::Modification(0);
@@ -10358,7 +10514,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
      // Translate the shaders now to obtain the sampler bindings.
      vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
-@@ -3829,6 +3839,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3829,6 +3852,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                     : 0;
  
@@ -10366,7 +10522,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
    // Update the textures before most other work in the submission because
    // samplers depend on this (and in case of sampler overflow in a submission,
    // submissions must be split) - may perform dispatches and copying.
-@@ -3894,6 +3905,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3894,6 +3918,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          descriptor_sets_kept = std::min(
              descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
        }
@@ -10375,7 +10531,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
      } else {
        // No or unknown pipeline layout previously bound - all bindings are in an
        // indeterminate state.
-@@ -4114,11 +4127,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4114,11 +4140,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    SubmitBarriersAndEnterRenderTargetCacheRenderPass(
        render_target_cache_->last_update_render_pass(),
        render_target_cache_->last_update_framebuffer());
@@ -10389,7 +10545,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
    } else {
      std::pair<VkBuffer, VkDeviceSize> index_buffer;
-@@ -4150,8 +4164,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -4150,8 +4177,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
              ? VK_INDEX_TYPE_UINT16
              : VK_INDEX_TYPE_UINT32);
@@ -10400,7 +10556,132 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
    }
  
    // Invalidate textures in memexported memory and watch for changes.
-@@ -6559,32 +6573,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -4970,6 +4997,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     // defined by vkQueueSubmit additionally include in the first
+     // synchronization scope all commands that occur earlier in submission
+     // order."
++    Profile::Timer fence_timer(profile_.fence_ns, profile_.file != nullptr);
+     VkResult wait_result =
+         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+@@ -5032,6 +5060,23 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     if (command_buffer_pair.first > submission_completed_) {
+       break;
+     }
++    if (command_buffer_pair.second.profile_queries != VK_NULL_HANDLE) {
++      uint64_t ticks[2] = {};
++      const VkResult result = dfn.vkGetQueryPoolResults(device,
++          command_buffer_pair.second.profile_queries, 0, 2, sizeof(ticks), ticks,
++          sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
++      if (result == VK_SUCCESS) {
++        const uint64_t mask = profile_.timestamp_bits == 64 ? UINT64_MAX :
++            ((uint64_t(1) << profile_.timestamp_bits) - 1);
++        const double ns = double((ticks[1] - ticks[0]) & mask) * profile_.timestamp_period;
++        std::fprintf(profile_.file, "G,%llu,%llu,%llu,%.0f\n",
++            (unsigned long long)Profile::Now(),
++            (unsigned long long)command_buffer_pair.second.profile_frame,
++            (unsigned long long)command_buffer_pair.first, ns);
++      } else {
++        std::fprintf(profile_.file, "# timestamp_result,%d\n", int(result));
++      }
++    }
+     command_buffers_writable_.push_back(command_buffer_pair.second);
+     command_buffers_submitted_.pop_front();
+   }
+@@ -5284,7 +5329,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       if (dfn.vkAllocateCommandBuffers(device, &command_buffer_allocate_info,
+                                        &command_buffer.buffer) != VK_SUCCESS) {
+         REXGPU_ERROR("Failed to allocate a Vulkan command buffer");
+-        dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
++        if (command_buffer.profile_queries != VK_NULL_HANDLE)
++          dfn.vkDestroyQueryPool(device, command_buffer.profile_queries, nullptr);
++      dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
+         return false;
+       }
+       command_buffers_writable_.push_back(command_buffer);
+@@ -5385,7 +5432,45 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
+       return false;
+     }
++    if (profile_.file && !profile_.timestamp_checked) {
++      profile_.timestamp_checked = true;
++      const auto& ifn = vulkan_device->vulkan_instance()->functions();
++      VkPhysicalDeviceProperties props{};
++      ifn.vkGetPhysicalDeviceProperties(vulkan_device->physical_device(), &props);
++      uint32_t count = 0;
++      ifn.vkGetPhysicalDeviceQueueFamilyProperties(vulkan_device->physical_device(), &count, nullptr);
++      std::vector<VkQueueFamilyProperties> queues(count);
++      ifn.vkGetPhysicalDeviceQueueFamilyProperties(vulkan_device->physical_device(), &count, queues.data());
++      profile_.timestamp_bits = queues[vulkan_device->queue_family_graphics_compute()].timestampValidBits;
++      profile_.timestamp_period = props.limits.timestampPeriod;
++      std::fprintf(profile_.file, "# timestamps,bits=%u,period_ns=%.6f\n",
++          profile_.timestamp_bits, profile_.timestamp_period);
++    }
++    if (profile_.file && !profile_.timestamp_allocation_failed &&
++        profile_.timestamp_bits && profile_.timestamp_period > 0 &&
++        command_buffer.profile_queries == VK_NULL_HANDLE) {
++      VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
++      info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++      info.queryCount = 2;
++      if (dfn.vkCreateQueryPool(device, &info, nullptr, &command_buffer.profile_queries) != VK_SUCCESS) {
++        command_buffer.profile_queries = VK_NULL_HANDLE;
++        profile_.timestamp_allocation_failed = true;
++        std::fprintf(profile_.file, "# timestamps,allocation_failed\n");
++      }
++    }
++    // Retain ownership even if command recording or queue submission fails.
++    command_buffers_writable_.back().profile_queries = command_buffer.profile_queries;
++    command_buffer.profile_frame = profile_.frame;
++    if (command_buffer.profile_queries != VK_NULL_HANDLE) {
++      dfn.vkCmdResetQueryPool(command_buffer.buffer, command_buffer.profile_queries, 0, 2);
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++          command_buffer.profile_queries, 0);
++    }
+     deferred_command_buffer_.Execute(command_buffer.buffer);
++    if (command_buffer.profile_queries != VK_NULL_HANDLE) {
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++          command_buffer.profile_queries, 1);
++    }
+     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to end a Vulkan command buffer");
+       return false;
+@@ -5414,11 +5499,16 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       return false;
+     }
+     VkResult submit_result;
++    const uint64_t profile_submit_start = profile_.file ? Profile::Now() : 0;
+     {
+       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+     }
++    if (profile_.file) {
++      ++profile_.submits;
++      profile_.submit_ns += Profile::Now() - profile_submit_start;
++    }
+     if (submit_result != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+       if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
+@@ -5464,7 +5554,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+       assert_true(command_buffers_submitted_.empty());
+       for (const CommandBuffer& command_buffer : command_buffers_writable_) {
+-        dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
++        if (command_buffer.profile_queries != VK_NULL_HANDLE)
++          dfn.vkDestroyQueryPool(device, command_buffer.profile_queries, nullptr);
++      dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
+       }
+       command_buffers_writable_.clear();
+ 
+@@ -5485,6 +5577,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     }
+   }
+ 
++  if (is_closing_frame) profile_.EndFrame();
+   return true;
+ }
+ 
+@@ -6559,32 +6652,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      sampler_count_pixel = 0;
      texture_count_pixel = 0;
    }
@@ -10435,7 +10716,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
      for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-@@ -6596,7 +6589,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6596,7 +6668,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
    size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
@@ -10444,7 +10725,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
           current_samplers_vertex_) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-@@ -6604,7 +6597,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6604,7 +6676,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
    size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
@@ -10453,7 +10734,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
      for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-@@ -6616,7 +6609,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6616,7 +6688,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
    size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
@@ -10462,7 +10743,7 @@ index 001f36b9824fa575468fe96615020cd3a9ab1a76..ec24625e2d03a09bb41277f58aaf49a2
      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
           current_samplers_pixel_) {
        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-@@ -6624,6 +6617,64 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+@@ -6624,6 +6696,64 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
      }
    }
  
@@ -10944,7 +11225,7 @@ index 0298f0628f59f75c020936e69a1043778d908270..f4f90589f3023445632d8c3776f85d55
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
 diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
-index 6788214140959ff171291ad9285c5b9725e688a0..f888265ad4867c950c03c75201234cc33fb7f0b2 100644
+index 6788214140959ff171291ad9285c5b9725e688a0..b301450354c6d7aa9cdf498c0fe82ce81d8b7c85 100644
 --- a/src/graphics/vulkan/shared_memory.cpp
 +++ b/src/graphics/vulkan/shared_memory.cpp
 @@ -27,6 +27,11 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
@@ -10959,7 +11240,7 @@ index 6788214140959ff171291ad9285c5b9725e688a0..f888265ad4867c950c03c75201234cc3
  namespace rex::graphics::vulkan {
  
  VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
-@@ -268,20 +273,68 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
+@@ -268,20 +273,71 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
    return true;
  }
  
@@ -11006,6 +11287,8 @@ index 6788214140959ff171291ad9285c5b9725e688a0..f888265ad4867c950c03c75201234cc3
 -                      upload_page_ranges.front().first)
 -                         << page_size_log2()));
 -  command_processor_.SubmitBarriers(true);
++  auto& profile = command_processor_.profile();
++  VulkanCommandProcessor::Profile::Timer upload_timer(profile.upload_ns, profile.file != nullptr);
 +  // Breaking the render pass for an upload costs a full store and reload of
 +  // its attachments on a tile-based GPU, so when nothing in the open pass reads
 +  // the pages, the copy goes ahead of the pass instead. Only while the buffer
@@ -11025,6 +11308,7 @@ index 6788214140959ff171291ad9285c5b9725e688a0..f888265ad4867c950c03c75201234cc3
 +    command_processor_.SubmitBarriers(true);
 +  }
 +  auto record_copy = [&](VkBuffer source) {
++    if (profile.file) ++profile.copies;
 +    if (hoist) {
 +      command_buffer.HoistCopyBufferBeforeOpenPass(source, buffer_, uint32_t(upload_regions_.size()),
 +                                                   upload_regions_.data());
@@ -11036,7 +11320,17 @@ index 6788214140959ff171291ad9285c5b9725e688a0..f888265ad4867c950c03c75201234cc3
    uint64_t submission_current = command_processor_.GetCurrentSubmission();
    bool successful = true;
    upload_regions_.clear();
-@@ -306,8 +359,7 @@ bool VulkanSharedMemory::UploadRanges(
+@@ -301,13 +357,17 @@ bool VulkanSharedMemory::UploadRanges(
+         break;
+       }
+       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
++      if (profile.file) {
++        profile.upload_bytes += upload_buffer_size;
++        ++profile.upload_ranges;
++        if (hoist) profile.hoisted_bytes += upload_buffer_size;
++      }
+       std::memcpy(upload_buffer_mapping,
+                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                    upload_buffer_size);
        if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
          assert_true(upload_buffer_previous != VK_NULL_HANDLE);
@@ -11046,7 +11340,7 @@ index 6788214140959ff171291ad9285c5b9725e688a0..f888265ad4867c950c03c75201234cc3
          upload_regions_.clear();
        }
        upload_buffer_previous = upload_buffer;
-@@ -325,8 +377,7 @@ bool VulkanSharedMemory::UploadRanges(
+@@ -325,8 +385,7 @@ bool VulkanSharedMemory::UploadRanges(
    }
    if (!upload_regions_.empty()) {
      assert_true(upload_buffer_previous != VK_NULL_HANDLE);
