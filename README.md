@@ -45,6 +45,69 @@ code uses FMA3 by default for faster explicit fused operations; the resulting
 executable requires an FMA3-capable CPU. Set `-DTEKKEN6_ENABLE_FMA3=OFF` for a
 portable build.
 
+## Linux (native x86-64, Vulkan)
+
+The Linux scripts build the same runtime and title compatibility patches as the
+macOS version. You need your own Xbox 360 Europe/USA Rev 1 disc image, about
+20 GB of free space beyond the ISO, and a Vulkan-capable GPU/driver.
+
+On Ubuntu 24.04 or a compatible distribution, install the build dependencies:
+
+```sh
+sudo apt-get install clang-19 lld-19 cmake ninja-build python3 git pkg-config \
+  libasound2-dev libpulse-dev libx11-xcb-dev libxext-dev libxrandr-dev libxcursor-dev \
+  libxi-dev libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
+  libwayland-dev libdecor-0-dev libudev-dev libdrm-dev libgbm-dev \
+  libegl1-mesa-dev nasm
+```
+
+```sh
+tools/build_linux.sh --iso /path/to/Tekken6.iso
+tools/run_linux.sh --log
+```
+
+Extraction requires an empty or absent `game/` directory. For subsequent builds,
+run `tools/build_linux.sh` without `--iso`. Alternatively, use `--game DIR` on
+the first build to link an existing extracted game folder. Compilation defaults
+to two processes to limit memory use; `--jobs N` overrides it. `--sdk-only`
+builds the SDK and rendering plugin without needing game data.
+
+The launcher defaults to Vulkan framebuffer rendering. `--fsi` selects fragment
+shader interlock and requires driver/device support for that feature. Use
+`--res 768x432`, `--offscreen 512`, or `--fullscreen` as needed. Arguments after
+`--` are passed directly to the runtime. F3 toggles FPS; keyboard controls match
+the table below, and game controllers use SDL3. Saves go in `user/`, shader
+caches in `cache/linux-fbo` or `cache/linux-fsi`, and optional logs in `logs/`.
+
+The Linux launcher bypasses guest vblank gating, caps actual guest swaps at
+60 FPS, and uses FIFO presentation. This avoids the 40–45 FPS slowdown seen
+with the SDK's original timing while keeping gameplay at normal speed on
+high-refresh displays. `--legacy-timing` restores the SDK timing for comparison.
+
+Initial testing on Zorin OS 18.1 (Ubuntu 24.04 base), Clang 19, RX 580 2048SP,
+and Mesa RADV 25.2.8 confirmed Practice mode near 60 FPS at the original internal
+resolution, with normal gameplay speed and audio. Lowering internal resolution
+alone did not fix the original slowdown. This is an initial gameplay check,
+not full coverage of all stages or modes. Stage testing also found 59–60 FPS
+on Tunnel Disaster, 57–59 on Electric Fountain, 45–50 on the forest/water stage,
+and 45–48 on Lightning Storm. The snow stage also slows during gameplay, with
+FPS rising in the pause menu. These are player observations, not controlled
+benchmarks; stage-specific performance still needs profiling.
+
+Scenario Campaign entered gameplay
+with missing scenery and stalled in one test; it remains a known failing case.
+The interlock path selected llvmpipe (software rendering) on this machine, so
+it is not a tested hardware alternative for this GPU.
+
+The SDK patch also fixes CPU spinning during the final fraction of a timed
+POSIX wait. Its Linux regression check covers timeouts, wait-any, wait-all,
+and auto-reset event consumption, and reports CPU use:
+
+```sh
+cmake --build build/linux-amd64 --target tekken6_linux_wait_test
+build/linux-amd64/tekken6_linux_wait_test
+```
+
 ## macOS
 
 ### What you need

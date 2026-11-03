@@ -163,6 +163,28 @@ index 4068d34daf146ab92a723be28dc1c5c9ea6fe274..64eb8d5bbec19cdf240ed8a23df84abd
  };
  
  }  // namespace rex::filesystem
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index da8e4324702a7df4bc6d04f9ec01f3df0c57318d..b20e3843cedbb192417f361ba738fc6ad118e322 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstring>
+ #include <functional>
+ #include <memory>
+@@ -245,6 +246,9 @@ class CommandProcessor {
+ 
+   uint32_t counter_ = 0;
+ 
++  std::chrono::steady_clock::time_point next_guest_frame_{};
++  int32_t guest_frame_limit_last_ = 0;
++
+   uint32_t primary_buffer_ptr_ = 0;
+   uint32_t primary_buffer_size_ = 0;
+ 
 diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
 index 96d362b3e7c1223a54ffec80d607b9484e20887d..d02f3348654c49e33e5ee68d76abba56b00f98ae 100644
 --- a/include/rex/graphics/d3d12/command_processor.h
@@ -1423,7 +1445,7 @@ index 1c735482a227d52375793f3dac1f9c04d1062b53..d0876f8e61f769282c2374290cf84b34
    if (result.blocks.empty()) {
      REXCODEGEN_WARN("Analyze: no blocks found for function 0x{:08X}", funcAddr);
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf37d1c6503 100644
+index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..66f0c795cccca05bb13c5819f2def5639915328d 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -14,13 +14,17 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -1570,7 +1592,22 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
          continue;
        }
  
-@@ -425,9 +486,16 @@ class PosixConditionBase {
+@@ -414,8 +475,12 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
++        // Preserve sub-millisecond time here. Truncating to milliseconds
++        // turns the final fraction of every timed wait into a busy loop.
++        auto remaining = end_time - now;
++        auto sleep_time = std::min(
++            remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++                           std::chrono::milliseconds(1)));
+         std::this_thread::sleep_for(sleep_time);
+       }
+     }
+@@ -425,9 +490,16 @@ class PosixConditionBase {
      return const_cast<std::condition_variable&>(cond_).native_handle();
    }
  
@@ -1587,7 +1624,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
    std::condition_variable cond_;
    std::mutex mutex_;
  };
-@@ -448,7 +516,31 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -448,7 +520,31 @@ class PosixCondition<Event> : public PosixConditionBase {
  
    bool Signal() override {
      auto lock = std::unique_lock<std::mutex>(mutex_);
@@ -1620,7 +1657,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
      cond_.notify_all();
      return true;
    }
-@@ -458,17 +550,67 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -458,17 +554,67 @@ class PosixCondition<Event> : public PosixConditionBase {
      signal_ = false;
    }
  
@@ -1690,7 +1727,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
  template <>
  class PosixCondition<Semaphore> : public PosixConditionBase {
   public:
-@@ -487,9 +629,16 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -487,9 +633,16 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
      }
      count_ += release_count;
      cond_.notify_all();
@@ -1707,7 +1744,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
   private:
    inline bool signaled() const override { return count_ > 0; }
    inline void post_execution() override {
-@@ -534,9 +683,18 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -534,9 +687,18 @@ class PosixCondition<Mutant> : public PosixConditionBase {
    inline void post_execution() override {
      count_++;
      owner_ = std::this_thread::get_id();
@@ -1726,7 +1763,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
  };
  
  template <>
-@@ -1043,6 +1201,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1043,6 +1205,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
    mutable std::condition_variable state_signal_;
    std::deque<std::function<void()>> user_callbacks_;
    std::atomic<bool> has_pending_user_callbacks_{false};
@@ -1740,7 +1777,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
  #if REX_PLATFORM_ANDROID
    // Name accessible via name() on Android before API 26 which added
    // pthread_getname_np.
-@@ -1068,9 +1233,15 @@ bool DispatchCurrentThreadUserCallback() {
+@@ -1068,9 +1237,15 @@ bool DispatchCurrentThreadUserCallback() {
    return current_thread_condition_ && current_thread_condition_->DispatchQueuedUserCallbacks();
  }
  
@@ -1758,7 +1795,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
  
  class ScopedAlertableState {
   public:
-@@ -1130,6 +1301,7 @@ class PosixConditionHandle : public T, public PosixWaitHandle {
+@@ -1130,6 +1305,7 @@ class PosixConditionHandle : public T, public PosixWaitHandle {
  
    PosixCondition<T>& condition() override { return handle_; }
    void* native_handle() const override { return handle_.native_handle(); }
@@ -1766,7 +1803,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
  
   protected:
    PosixCondition<T> handle_;
-@@ -1165,6 +1337,7 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
+@@ -1165,6 +1341,7 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
  
    ScopedAlertableState alertable_state_guard(true);
    auto deadline = ComputeAlertableDeadline(timeout);
@@ -1774,7 +1811,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
  
    while (true) {
      if (DispatchCurrentThreadUserCallback()) {
-@@ -1173,10 +1346,12 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
+@@ -1173,10 +1350,12 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
      if (HasAlertableTimeoutElapsed(deadline)) {
        return WaitResult::kTimeout;
      }
@@ -1789,7 +1826,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b5733fa2f54ba233ba23f3614229dcf3
    }
  }
  
-@@ -1188,25 +1363,34 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
+@@ -1188,25 +1367,34 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
    if (posix_wait_handle_to_signal == nullptr || posix_wait_handle_to_wait_on == nullptr) {
      return WaitResult::kFailed;
    }
@@ -1976,14 +2013,44 @@ index aed2884d4fa92298fa27a017efbbb7c25d4c818d..21f9a42e4541799729b4d4bd92515ce6
  NullDevice::~NullDevice() = default;
  
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a74437566e952ee32ffc2761bed766aa3ba0c45e..f16aa9203247208d4bdf83d2c96335ea1fa044e9 100644
+index a74437566e952ee32ffc2761bed766aa3ba0c45e..c06c3e2328032db3c99bd951653636fbe5e87811 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -930,19 +930,20 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -37,6 +37,11 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
++REXCVAR_DEFINE_INT32(guest_frame_limit, 0, "GPU",
++                    "Maximum guest frame swaps per second, independent of guest vsync (0 disables)")
++    .range(0, 1000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -930,19 +935,38 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
                                                    uint32_t count) {
    SCOPE_profile_cpu_f("gpu");
  
 -#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  // Pace actual guest swaps independently of the vblank worker. This allows
++  // titles to bypass coarse vblank waits without running faster than intended
++  // on high-refresh displays. Keep state per command processor, not global.
++  const int32_t frame_limit = REXCVAR_GET(guest_frame_limit);
++  if (frame_limit > 0) {
++    const auto interval = std::chrono::nanoseconds(1000000000LL / frame_limit);
++    auto now = std::chrono::steady_clock::now();
++    if (frame_limit != guest_frame_limit_last_ ||
++        now > next_guest_frame_ + interval) {
++      next_guest_frame_ = now;
++    }
++    if (now < next_guest_frame_) {
++      std::this_thread::sleep_until(next_guest_frame_);
++    }
++    next_guest_frame_ += interval;
++  }
++  guest_frame_limit_last_ = frame_limit;
++
    {
      static uint64_t last_frame_tick = 0;
      uint64_t now = rex::chrono::Clock::QueryHostTickCount();

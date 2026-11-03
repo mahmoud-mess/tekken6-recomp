@@ -3,7 +3,10 @@
 The SDK submodule uses the public upstream tag `nightly-20260904-0c7b01a0`
 (`0c7b01a0ac0479801757507d80533f662fa0815d`).
 `0001-tekken6-runtime.patch` contains the title's runtime compatibility,
-rendering, ROV specialization and crash-report support.
+rendering, ROV specialization and crash-report support. Linux additions preserve
+sub-millisecond POSIX wait durations (avoiding busy polling) and add the optional
+`guest_frame_limit` setting. The Linux launcher uses a 60 FPS swap cap with guest
+vsync disabled to avoid the observed missed-vblank slowdown.
 
 From the project root:
 

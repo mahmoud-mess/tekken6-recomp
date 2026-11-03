@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <filesystem>
 
 #include <rex/rex_app.h>
 #include <rex/logging.h>
@@ -25,6 +26,15 @@ class Tekken6App final : public rex::ReXApp {
   }
 
  protected:
+  void OnLoadXexImage(std::string& xex_image) override {
+    // The SDK preflights this path on the host before its case-insensitive
+    // guest filesystem is used. Retail discs name the file Default.xex.
+    if (!std::filesystem::is_regular_file(game_data_root() / "default.xex") &&
+        std::filesystem::is_regular_file(game_data_root() / "Default.xex")) {
+      xex_image = "game:\\Default.xex";
+    }
+  }
+
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     rex::ReXApp::OnCreateDialogs(drawer);
     SetGuestFrameStats([this] {
