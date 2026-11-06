@@ -10,6 +10,8 @@ an independent 60 Hz guest vblank clock. Linux memory protection queries
 optionally use PROCMAP_QUERY on
 supported kernels, with a legacy parser fallback. These changes were tested in
 Scenario Campaign to restore scenery, near-60 FPS gameplay, and normal cutscenes.
+Linux guest name/sign-in queries use the system account username; the profile's
+storage name and XUID stay unchanged so existing saves remain accessible.
 
 From the project root:
 

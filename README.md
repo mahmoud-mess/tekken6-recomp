@@ -78,6 +78,9 @@ shader interlock and requires driver/device support for that feature. Use
 `--` are passed directly to the runtime. F3 toggles FPS; keyboard controls match
 the table below, and game controllers use SDL3. Saves go in `user/`, shader
 caches in `cache/linux-fbo` or `cache/linux-fsi`, and optional logs in `logs/`.
+The in-game player name uses your Linux account username (within the game's
+15-character name limit), with `User` as a fallback if account lookup fails.
+The saved profile identity and existing save locations stay the same.
 
 The Linux launcher keeps guest vblank at 60 Hz, uses fast GPU wait polling and
 FIFO presentation, and enables direct Linux memory-mapping queries where the

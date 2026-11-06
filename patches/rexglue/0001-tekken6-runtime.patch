@@ -944,6 +944,19 @@ index 9b9cf9eb98537111d3a1034b47f4f18ecffaa2f8..23909788f08b1931e6e15787e2480865
  
    uint32_t process_type() const;
    void set_process_type(uint32_t value);
+diff --git a/include/rex/system/xam/user_profile.h b/include/rex/system/xam/user_profile.h
+index ec370171dd30e4b204f7a1fe3eddc2978179395e..d18b3f8ce59189fd99ac48b51cfb6d0d3329c405 100644
+--- a/include/rex/system/xam/user_profile.h
++++ b/include/rex/system/xam/user_profile.h
+@@ -218,6 +218,8 @@ class UserProfile {
+ 
+   uint64_t xuid() const { return xuid_; }
+   std::string name() const { return name_; }
++  // Guest-visible name, independent of the name used for profile storage.
++  std::string display_name() const;
+   uint32_t signin_state() const { return 1; }
+   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
+ 
 diff --git a/include/rex/system/xfile.h b/include/rex/system/xfile.h
 index 6063f3cc5d6c2f3b097a27c719dd34235a6d1cc4..b592a384d17bc334745fcbfede942c79ec0fe82c 100644
 --- a/include/rex/system/xfile.h
@@ -11510,9 +11523,36 @@ index 31c53846384be172aaf78d985f6075ff552e2b47..bcadd43ccf6cd2ad03971bc81d128a9e
  REX_HOOK(rexcrt_XMemCpy, rex::kernel::crt::native_XMemCpy)
  REX_HOOK(rexcrt_XMemSet, rex::kernel::crt::native_XMemSet)
 diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
-index 8778066e8369026f9a3064fe156e43d8070f28fc..08134f4176e6a62aa5d9cad2a339b07eecce33e5 100644
+index 8778066e8369026f9a3064fe156e43d8070f28fc..e70fcf7384ac2eab530e5c2f8fc6396f79c131f0 100644
 --- a/src/kernel/xam/xam_user.cpp
 +++ b/src/kernel/xam/xam_user.cpp
+@@ -99,7 +99,7 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+   info->xuid = user_profile->xuid();
+   info->signin_state = user_profile->signin_state();
+-  rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
++  rex::string::copy_truncating(info->name, user_profile->display_name(), rex::countof(info->name));
+   return X_E_SUCCESS;
+ }
+ 
+@@ -113,7 +113,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
+   }
+ 
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-  const auto& user_name = user_profile->name();
++  const auto& user_name = user_profile->display_name();
+   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+   return X_E_SUCCESS;
+ }
+@@ -132,7 +132,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
+   }
+ 
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-  auto user_name = rex::string::to_utf16(user_profile->name());
++  auto user_name = rex::string::to_utf16(user_profile->display_name());
+   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+   return X_E_SUCCESS;
+ }
 @@ -694,8 +694,11 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
      return X_ERROR_INVALID_PARAMETER;
    }
@@ -11925,6 +11965,56 @@ index 46ab7970027e31d59a6117cd3d2b247191a1ed6a..61121d7ed7567f6bdc298c1aeebfa35f
    context_->r13.u64 = pcr_address;  // PCR address
  
    // Note(tomc): the rexglue abi passes memory base via 'base' parameter to each function call,
+diff --git a/src/system/xam/user_profile.cpp b/src/system/xam/user_profile.cpp
+index a77f5e6e9f7ba91ab34e2e9de7ea5483858ec8e7..830111317995a79ec822c0dc98ba3d0c2f1c1195 100644
+--- a/src/system/xam/user_profile.cpp
++++ b/src/system/xam/user_profile.cpp
+@@ -17,6 +17,12 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/user_profile.h>
+ 
++#if REX_PLATFORM_LINUX
++#include <cerrno>
++#include <pwd.h>
++#include <unistd.h>
++#endif
++
+ namespace rex {
+ namespace system {
+ namespace xam {
+@@ -93,6 +99,32 @@ UserProfile::UserProfile() {
+   AddSetting(std::make_unique<BinarySetting>(0x63E83FFD));
+ }
+ 
++std::string UserProfile::display_name() const {
++#if REX_PLATFORM_LINUX
++  static const std::string account_name = []() -> std::string {
++    // Resolve the actual login account, rather than trusting USER/LOGNAME.
++    // Cache the lookup so guest name requests do not repeatedly call NSS.
++    std::vector<char> buffer(16384);
++    while (buffer.size() <= 1024 * 1024) {
++      struct passwd entry{};
++      struct passwd* result = nullptr;
++      const int error = getpwuid_r(getuid(), &entry, buffer.data(), buffer.size(), &result);
++      if (error == ERANGE) {
++        buffer.resize(buffer.size() * 2);
++        continue;
++      }
++      if (!error && result && result->pw_name && result->pw_name[0]) {
++        return result->pw_name;
++      }
++      break;
++    }
++    return {};
++  }();
++  if (!account_name.empty()) return account_name;
++#endif
++  return name_;
++}
++
+ void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
+   Setting* previous_setting = setting.get();
+   std::swap(settings_[setting->setting_id], previous_setting);
 diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
 index 4179e8b279d0f17f00e5b289a4daf383d3e82401..9498520b5a3fdf3c23d685a11b0f941f02c60ec1 100644
 --- a/src/system/xfile.cpp
