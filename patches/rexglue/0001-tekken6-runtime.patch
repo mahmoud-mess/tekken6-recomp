@@ -12596,6 +12596,53 @@ index 43d6c061f64020b0d01274b7ea123634a6f69e4c..7cbaf8197dcc5fb50d9e5f6704315903
        }
      }
  #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed98ba3fa923789f4035c1e7a7c10bfdb2c1..17e78dceb0a3ae68d469c17b4ac5c4758e41a8e6 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -465,7 +465,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+     }
+     // Try to recover from the connection becoming outdated in the previous
+     // paint.
+-    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
++    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated ||
++        (force_paint && surface_paint_connection_state_ ==
++                            SurfacePaintConnectionState::kUnconnectedRetryAtStateChange)) {
++      // An expose can make a newly mapped surface usable without changing its
++      // pixel size. Retry on that explicit event, without polling in a paint loop.
+       UpdateSurfacePaintConnectionFromUIThread(nullptr, false);
+     }
+     // If still paintable or recovered successfully, paint.
+@@ -1361,6 +1365,8 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
+     uint32_t surface_width = 0, surface_height = 0;
+     bool surface_area_available = surface_->GetSize(surface_width, surface_height);
+     if (!surface_area_available) {
++      REXLOG_INFO("Presenter: Surface type {} has no drawable size; waiting for resize or expose",
++                  uint32_t(surface_->GetType()));
+       // The surface is currently zero-area (or has become zero-area), try again
+       // when it's resized.
+       DisconnectPaintingFromSurfaceFromUIThread(
+@@ -1385,15 +1391,19 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
+           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
+           surface_width_in_paint_connection_ = surface_width;
+           surface_height_in_paint_connection_ = surface_height;
+-          if (!is_reconnect) {
++          if (!is_reconnect && repaint_needed_out) {
+             *repaint_needed_out = true;
+           }
+           break;
+         case SurfacePaintConnectResult::kFailure:
++          REXLOG_WARN("Presenter: Surface type {} ({}x{}) connection failed; waiting for resize or expose",
++                      uint32_t(surface_->GetType()), surface_width, surface_height);
+           surface_paint_connection_state_ =
+               SurfacePaintConnectionState::kUnconnectedRetryAtStateChange;
+           break;
+         case SurfacePaintConnectResult::kFailureSurfaceUnusable:
++          REXLOG_ERROR("Presenter: Surface type {} ({}x{}) reported unusable",
++                       uint32_t(surface_->GetType()), surface_width, surface_height);
+           surface_paint_connection_state_ =
+               SurfacePaintConnectionState::kUnconnectedSurfaceReportedUnusable;
+           break;
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
 index b94fe9e4814b7e66305d3b983732aebdfb0bced4..020fb58d412109dda15d48a527ef9fcf5b913412 100644
 --- a/src/ui/rex_app.cpp
@@ -12630,6 +12677,32 @@ index b94fe9e4814b7e66305d3b983732aebdfb0bced4..020fb58d412109dda15d48a527ef9fcf
      if (debug_overlay_) {
        debug_overlay_.reset();
      } else {
+diff --git a/src/ui/surface_gnulinux.cpp b/src/ui/surface_gnulinux.cpp
+index c6f57300d7d19cbf29919a7264794f7244d14afd..034ac28514e2f35bc080a9bba5b933633772dd69 100644
+--- a/src/ui/surface_gnulinux.cpp
++++ b/src/ui/surface_gnulinux.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include <SDL3/SDL.h>
+ 
++#include <rex/logging.h>
+ #include <rex/ui/surface_gnulinux.h>
+ 
+ namespace rex {
+@@ -32,7 +33,12 @@ bool XcbWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) co
+ 
+ bool WaylandSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
+   int w = 0, h = 0;
+-  if (!SDL_GetWindowSizeInPixels(sdl_window_, &w, &h) || w <= 0 || h <= 0) {
++  if (!SDL_GetWindowSizeInPixels(sdl_window_, &w, &h)) {
++    REXLOG_WARN("WaylandSurface: SDL_GetWindowSizeInPixels failed: {}", SDL_GetError());
++    return false;
++  }
++  if (w <= 0 || h <= 0) {
++    REXLOG_INFO("WaylandSurface: Drawable size is {}x{}", w, h);
+     return false;
+   }
+   width_out = uint32_t(w);
 diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
 index 8197bb4610dcc3e53946a84864e4b936af21d0f0..db6cf74275f64fd82eebb3b40d7d9755c47b3f19 100644
 --- a/src/ui/vulkan/vulkan_device.cpp
@@ -12663,7 +12736,7 @@ index e2e2c163bec4b3aafc5ec04189aa39deb935a2dc..d1e83ecb9b9542e91fbe236633f10a7a
  
  }  // namespace rex::ui::vulkan
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index 23645effaa5b659471aae7375b3b0fd48f41c35e..4e51713833091cc4e735df2f429b531d3af0c3fe 100644
+index 23645effaa5b659471aae7375b3b0fd48f41c35e..c3899e60bf769d6399d8a28af3df3815f515b660 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/src/ui/vulkan/vulkan_presenter.cpp
 @@ -11,6 +11,7 @@
@@ -12707,7 +12780,13 @@ index 23645effaa5b659471aae7375b3b0fd48f41c35e..4e51713833091cc4e735df2f429b531d
      paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
          vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
          old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
-@@ -870,6 +883,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+@@ -866,10 +879,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+         return SurfacePaintConnectResult::kFailureSurfaceUnusable;
+     }
+     if (vulkan_surface_create_result != VK_SUCCESS) {
+-      REXLOG_ERROR("VulkanPresenter: Failed to create a Vulkan surface");
++      REXLOG_ERROR("VulkanPresenter: Failed to create a Vulkan surface of type {}: VkResult {}",
++                   uint32_t(surface_type), int32_t(vulkan_surface_create_result));
        return SurfacePaintConnectResult::kFailure;
      }
      bool surface_unusable;
@@ -12715,7 +12794,7 @@ index 23645effaa5b659471aae7375b3b0fd48f41c35e..4e51713833091cc4e735df2f429b531d
      paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
          vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
          VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
-@@ -1079,6 +1093,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
+@@ -1079,6 +1094,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
    bool refresher_succeeded = refresher(context);
    if (refresher_succeeded) {
      image_instance.ever_successfully_refreshed = true;
@@ -12726,7 +12805,26 @@ index 23645effaa5b659471aae7375b3b0fd48f41c35e..4e51713833091cc4e735df2f429b531d
    }
    // Even if the refresher has returned false, it still might have submitted
    // some commands referencing the image. It's better to put an excessive
-@@ -1528,7 +1546,77 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+@@ -1149,6 +1168,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   if (!image_extent.width || !image_extent.height ||
+       image_extent.width > max_framebuffer_extent.width ||
+       image_extent.height > max_framebuffer_extent.height) {
++    REXLOG_WARN("VulkanPresenter: No usable swapchain extent: requested {}x{}, clamped {}x{}, framebuffer limit {}x{}",
++                width, height, image_extent.width, image_extent.height,
++                max_framebuffer_extent.width, max_framebuffer_extent.height);
+     return VK_NULL_HANDLE;
+   }
+ 
+@@ -1181,6 +1203,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+     }
+   }
+   if (queue_family_index_present == UINT32_MAX) {
++    REXLOG_WARN("VulkanPresenter: No created queue family supports presentation to this surface on '{}'",
++                vulkan_device->properties().deviceName);
+     // Not unusable though - may become presentable if the window (with the same
+     // surface) moved to a different display, for instance.
+     return VK_NULL_HANDLE;
+@@ -1528,7 +1552,77 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
    return true;
  }
  
@@ -12804,7 +12902,7 @@ index 23645effaa5b659471aae7375b3b0fd48f41c35e..4e51713833091cc4e735df2f429b531d
    // Begin the submission in place of the one not currently potentially used on
    // the GPU.
    uint64_t current_paint_submission_index =
-@@ -1631,13 +1719,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -1631,13 +1725,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
    GuestOutputProperties guest_output_properties;
    GuestOutputPaintConfig guest_output_paint_config;
    std::shared_ptr<GuestOutputImage> guest_output_image;
@@ -12821,7 +12919,7 @@ index 23645effaa5b659471aae7375b3b0fd48f41c35e..4e51713833091cc4e735df2f429b531d
      }
      // Incremented the reference count of the guest output image - safe to leave
      // the consumer critical section now as everything here either will be using
-@@ -2236,12 +2326,178 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -2236,12 +2332,178 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
    present_info.pSwapchains = &paint_context_.swapchain;
    present_info.pImageIndices = &swapchain_image_index;
    present_info.pResults = nullptr;
@@ -13000,7 +13098,7 @@ index 23645effaa5b659471aae7375b3b0fd48f41c35e..4e51713833091cc4e735df2f429b531d
    switch (present_result) {
      case VK_SUCCESS:
        return PaintResult::kPresented;
-@@ -2589,6 +2845,9 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffec
+@@ -2589,6 +2851,9 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffec
    VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {};
    input_assembly_state.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
    input_assembly_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
@@ -13083,7 +13181,7 @@ index b4e045f3fe58a6647c467957470e567fd1c92a64..e6389db396efa3cf9d51f3c5c0feed1a
  REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                       "Monitor index to display on (0 = default, 1 = primary, 2 = "
 diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
-index 2251429b7f5c0791262a6d3a866bf039c952b1d0..af04385b92e95ab961e3d95986872ce3ba89f3d2 100644
+index 2251429b7f5c0791262a6d3a866bf039c952b1d0..68792ad8a1c3d62bed0b111ccd5bda3fd96edbae 100644
 --- a/src/ui/window_sdl.cpp
 +++ b/src/ui/window_sdl.cpp
 @@ -136,7 +136,10 @@ WindowSDL::~WindowSDL() {
@@ -13112,6 +13210,50 @@ index 2251429b7f5c0791262a6d3a866bf039c952b1d0..af04385b92e95ab961e3d95986872ce3
  #if REX_PLATFORM_MAC
    CFPreferencesSetAppValue(CFSTR("ApplePressAndHoldEnabled"), kCFBooleanFalse,
                             kCFPreferencesCurrentApplication);
+@@ -231,6 +241,7 @@ void WindowSDL::DestroySDLWindow() {
+ void* WindowSDL::GetNativeWindowHandle() const {
+ #if REX_PLATFORM_WIN32
+   if (!sdl_window_) {
++    REXLOG_ERROR("WindowSDL: Cannot create a presentation surface without an SDL window");
+     return nullptr;
+   }
+   return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
+@@ -406,6 +417,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+     auto* wl_surface_ptr = static_cast<struct wl_surface*>(
+         SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr));
+     if (wl_display_ptr && wl_surface_ptr) {
++      REXLOG_INFO("WindowSDL: Creating Wayland presentation surface");
+       return std::make_unique<WaylandSurface>(wl_display_ptr, wl_surface_ptr, sdl_window_);
+     }
+   }
+@@ -415,10 +427,14 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+     auto x11_window = static_cast<xcb_window_t>(
+         SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
+     if (display && x11_window) {
++      REXLOG_INFO("WindowSDL: Creating X11/XCB presentation surface");
+       return std::make_unique<XcbWindowSurface>(XGetXCBConnection(display), x11_window);
+     }
+   }
+ #endif
++  REXLOG_ERROR("WindowSDL: No native presentation surface for SDL driver '{}' (allowed types {:#x}): {}",
++               SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "unknown",
++               allowed_types, SDL_GetError());
+   return nullptr;
+ }
+ 
+@@ -479,7 +495,12 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
+     case SDL_EVENT_WINDOW_FOCUS_LOST:
+       OnFocusUpdate(false, destruction_receiver);
+       break;
++    case SDL_EVENT_WINDOW_SHOWN:
+     case SDL_EVENT_WINDOW_EXPOSED:
++      // Native handles may become available only after the window is shown.
++      if (!HasSurface()) {
++        OnSurfaceChanged(true);
++      }
+       // The platform cannot retain the previous image; force the paint.
+       OnPaint(true);
+       break;
 diff --git a/tools/build_fused_resolve_shader.py b/tools/build_fused_resolve_shader.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..4fac2488052efd95c30432a3e1600d0cb6ac48dc

@@ -13,6 +13,15 @@ Scenario Campaign to restore scenery, near-60 FPS gameplay, and normal cutscenes
 Linux guest name/sign-in queries use the system account username; the profile's
 storage name and XUID stay unchanged so existing saves remain accessible.
 
+Presentation startup logs identify the SDL native surface, unavailable drawable
+sizes, unusable swapchain extents and missing presentation queues. SDL show/expose
+events retry transient connection failures even if the pixel size is unchanged.
+For a blank Linux window, rebuild with `tools/build_linux.sh --jobs 6` (reuse the
+existing extracted game), then run `tools/run_linux.sh --fullscreen --log`.
+Keep the startup log through the first swapchain message or connection failure.
+To compare the X11/XWayland path, run
+`tools/run_linux.sh --fullscreen --log -- --video_driver=x11`.
+
 From the project root:
 
 ```sh
