@@ -8,6 +8,8 @@ jobs=2
 iso=
 game_src=
 sdk_only=0
+fma=OFF
+if grep -qw fma /proc/cpuinfo; then fma=ON; fi
 usage() {
   cat <<'HELP'
 Usage: tools/build_linux.sh [options]
@@ -15,6 +17,7 @@ Usage: tools/build_linux.sh [options]
   --game DIR       Link an existing game folder as game/ (must be absent)
   --build-dir DIR  Build directory (default: build/linux-amd64)
   --jobs N         Parallel compiler processes (default: 2 to limit memory use)
+  --fma on|off     FMA3 guest code (default: detect this CPU)
   --sdk-only       Build SDK, runtime, GPU plugin and extractor without game data
 Requires CMake 3.25+, Ninja, Python 3, Clang 19+ and Linux development libraries.
 CC/CXX may select another Clang version. Then launch with tools/run_linux.sh.
@@ -22,13 +25,19 @@ HELP
 }
 while (($#)); do
   case "$1" in
-    --iso|--game|--build-dir|--jobs)
+    --iso|--game|--build-dir|--jobs|--fma)
       [[ $# -ge 2 && -n "$2" ]] || { echo "Missing value for $1" >&2; exit 2; }
       case "$1" in
         --iso) iso="$(realpath -e -- "$2")" ;;
         --game) game_src="$(realpath -e -- "$2")" ;;
         --build-dir) build_dir="$2" ;;
         --jobs) jobs="$2" ;;
+        --fma)
+          case "$2" in
+            on|ON) fma=ON ;;
+            off|OFF) fma=OFF ;;
+            *) echo "--fma must be on or off" >&2; exit 2 ;;
+          esac ;;
       esac
       shift 2 ;;
     --sdk-only) sdk_only=1; shift ;;
@@ -39,6 +48,12 @@ done
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || { echo "This script currently targets x86-64 Linux." >&2; exit 2; }
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "--jobs must be a positive integer" >&2; exit 2; }
 [[ -z "$iso" || -z "$game_src" ]] || { echo "Choose --iso or --game" >&2; exit 2; }
+if (( ! sdk_only )) && [[ -z "$iso" && -z "$game_src" && ! -f game/Default.xex && ! -f game/default.xex ]]; then
+  [[ -t 0 ]] || { echo "Provide your own Tekken 6 ISO with --iso FILE." >&2; exit 2; }
+  read -e -r -p 'Path to your Tekken 6 Xbox 360 ISO: ' iso
+  if [[ "$iso" == '~/'* ]]; then iso="$HOME/${iso:2}"; fi
+  iso="$(realpath -e -- "$iso")"
+fi
 cc="${CC:-clang-19}"
 cxx="${CXX:-clang++-19}"
 for tool in cmake ninja python3 "$cc" "$cxx"; do
@@ -62,6 +77,7 @@ cmake -S . -B "$build_dir" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx" \
   -DCMAKE_CXX_FLAGS=-mssse3 \
+  -DTEKKEN6_ENABLE_FMA3="$fma" \
   -DREXGLUE_USE_D3D12=OFF -DREXGLUE_USE_VULKAN=ON \
   -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_ENABLE_PERF_COUNTERS=OFF \
   -DREXGLUE_RECOMP_DEBUG_INFO=none
@@ -77,7 +93,8 @@ fi
 [[ -f game/Default.xex ]] || { echo "Missing game/Default.xex; use --iso FILE or --game DIR." >&2; exit 1; }
 actual="$(sha256sum game/Default.xex)"
 if [[ "${actual%% *}" != ee138a4fe8d32a0edc131451377f4377041a49626153fa992db24f5420a7f15c ]]; then
-  echo "Warning: XEX differs from the tested Europe/USA Rev 1 image: ${actual%% *}" >&2
+  echo "Unsupported XEX; expected Tekken 6 Europe/USA Rev 1: ${actual%% *}" >&2
+  exit 1
 fi
 cmake --build "$build_dir" --target tekken6_codegen --parallel "$jobs"
 # Codegen creates the guest source list; configure again before compiling it.

@@ -47,106 +47,131 @@ portable build.
 
 ## Linux (native x86-64, Vulkan)
 
-The Linux scripts build the same runtime and title compatibility patches as the
-macOS version. You need your own Xbox 360 Europe/USA Rev 1 disc image, about
-20 GB of free space beyond the ISO, and a Vulkan-capable GPU/driver.
+The Linux port uses the same runtime and title compatibility patches as macOS.
+You need your own Xbox 360 Tekken 6 Europe/USA Rev 1 ISO, a Vulkan-capable
+GPU/driver, and about 25 GB of free space beyond the ISO for sources, build
+files and the locally generated app. Release packages contain builder tools
+only: no ISO, game assets, generated guest code, game executable or saves.
 
-On Ubuntu 24.04 or a compatible distribution, install the build dependencies:
+### Dependencies
+
+On Ubuntu 24.04 or a compatible distribution:
 
 ```sh
 sudo apt-get install clang-19 lld-19 cmake ninja-build python3 git pkg-config \
   libasound2-dev libpulse-dev libx11-xcb-dev libxext-dev libxrandr-dev libxcursor-dev \
   libxi-dev libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
   libwayland-dev libdecor-0-dev libudev-dev libdrm-dev libgbm-dev \
-  libegl1-mesa-dev nasm
+  libegl1-mesa-dev nasm zenity
 ```
 
+Clang 19 and C++23 `std::expected` support are required. The SDL builder uses
+native file dialogs; Zenity supplies them on desktops without a dialog portal.
+Building the game also needs Internet access to fetch the pinned source and
+SDK submodules. The prebuilt builder requires compatible x86-64 Linux system
+libraries; it is not a complete distribution-independent runtime.
+
+### ISO builder
+
+Unpack a Linux **builder** archive and run `./Build.sh`. The SDL interface asks
+for your own ISO and an output folder. **Check setup** checks the build tools
+and supported game version without compiling. **Build game** fetches the pinned
+source and dependencies, extracts your ISO locally, compiles the game, and
+creates your personal app folder. **Build options** lets you choose the number
+of compiler jobs and enable or disable FMA3. Defaults are two jobs and FMA3
+only when supported by the current CPU. Turning FMA3 off permits use on CPUs
+without that extension.
+
+The same builder supports terminal use:
+
 ```sh
-tools/build_linux.sh --iso /path/to/Tekken6.iso
+./Build.sh --iso /path/to/Tekken6.iso --check
+./Build.sh --iso /path/to/Tekken6.iso --output /path/to/Tekken6-Linux --jobs 2 --fma auto
+```
+
+Sources, extracted data, intermediate files and build logs stay under
+`$XDG_CACHE_HOME/tekken6-builder` (normally `~/.cache/tekken6-builder`). They are
+kept to allow later builds to reuse completed work. The output app folder
+contains `Play.sh`; run it after a successful local build. Saves and shader
+caches stay inside that folder. Keep your generated game files private; the
+release packager below distributes only the builder tools.
+
+To create a builder archive from source, initialize the SDK and configure CMake:
+
+```sh
+git submodule update --init --recursive
+python3 tools/apply_rexglue_patches.py
+cmake -S . -B build/linux-amd64 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 \
+  -DCMAKE_CXX_FLAGS=-mssse3 -DREXGLUE_USE_D3D12=OFF -DREXGLUE_USE_VULKAN=ON \
+  -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_ENABLE_PERF_COUNTERS=OFF
+cmake --build build/linux-amd64 --target tekken6_builder xdvdfs_tool --parallel 2
+python3 tools/package_linux_builder.py
+```
+
+This creates `build/Tekken6-Builder-Linux-<version>.tar.xz` and its SHA-256
+checksum. It includes the SDL builder, ISO inspection/extraction tool, Python
+driver, README, source revision manifest and SDL license. It never reads the
+local `game/`, `generated/default/`, app folders, saves or caches. Only the two
+tool targets are needed to prepare a release; no game is compiled or packaged.
+The source commit recorded in the manifest must be pushed to the selected
+repository before distributing the builder. `--repository URL` selects another
+public GitHub source repository; the default is the `fork` remote, or `origin`.
+
+### Building directly from a checkout
+
+```sh
+tools/build_linux.sh --iso /path/to/Tekken6.iso --jobs 2
 tools/run_linux.sh --log
 ```
 
-Extraction requires an empty or absent `game/` directory. For subsequent builds,
-run `tools/build_linux.sh` without `--iso`. Alternatively, use `--game DIR` on
-the first build to link an existing extracted game folder. Compilation defaults
-to two processes to limit memory use; `--jobs N` overrides it. `--sdk-only`
-builds the SDK and rendering plugin without needing game data.
+Without `--iso`, the script asks for an ISO when no extracted game is present.
+Extraction requires an empty or absent `game/` directory. Subsequent builds use
+`tools/build_linux.sh` without `--iso`. `--game DIR` can link an existing game
+folder on the first build; `--fma on|off` controls FMA3. `--sdk-only` builds the
+SDK, rendering plugin and extractor without game data. A personal app folder
+can be generated after a local game build with `python3 tools/package_linux.py`;
+this app folder is not a release artifact.
 
-The launcher defaults to Vulkan framebuffer rendering. `--fsi` selects fragment
-shader interlock and requires driver/device support for that feature. Use
-`--res 768x432`, `--offscreen 512`, or `--fullscreen` as needed. Arguments after
-`--` are passed directly to the runtime. F3 toggles FPS; keyboard controls match
-the table below, and game controllers use SDL3. Saves go in `user/`, shader
-caches in `cache/linux-fbo` or `cache/linux-fsi`, and optional logs in `logs/`.
-The in-game player name uses your Linux account username (within the game's
-15-character name limit), with `User` as a fallback if account lookup fails.
-The saved profile identity and existing save locations stay the same.
+### Linux progress and runtime options
 
-The Linux launcher keeps guest vblank at 60 Hz, uses fast GPU wait polling and
-FIFO presentation, and enables direct Linux memory-mapping queries where the
-kernel supports them. It does not add a separate guest swap limiter: the extra
-limiter can interact poorly with the game's own pacing. `--legacy-timing`
-restores the SDK's original timing for comparison.
+Practice has been checked near 60 FPS at the original internal resolution,
+with normal gameplay speed and audio, on Zorin OS 18.1, Linux 7.0, Ryzen 5 5500,
+RX 580 2048SP and Mesa RADV 25.2.8. Follow-up player checks also reported steady
+60 FPS on the storm stage and Mystical Forest, which previously slowed down.
+These are player observations, not repeated benchmarks. Snow/Manji Valley and
+other remaining stages still need follow-up checks.
 
-Initial testing on Zorin OS 18.1 (Ubuntu 24.04 base), Clang 19, RX 580 2048SP,
-and Mesa RADV 25.2.8 confirmed Practice mode near 60 FPS at the original internal
-resolution, with normal gameplay speed and audio. Lowering internal resolution
-alone did not fix the original slowdown. This is an initial gameplay check,
-not full coverage of all stages or modes. Stage testing also found 59–60 FPS
-on Tunnel Disaster, 57–59 on Electric Fountain, 45–50 on the forest/water stage,
-and 45–48 on Lightning Storm. The snow stage also slows during gameplay, with
-FPS rising in the pause menu. These observations used the earlier timing and
-memory-query settings. With the updated settings below, the user reported
-steady 60 FPS in Practice, including the storm stage and Mystical Forest.
-These are player observations, not controlled benchmarks.
+Scenario Campaign initially showed characters over a black stage and nearly
+stalled. A separate 60 Hz guest clock restored scenery; direct Linux mapping
+queries reduced CPU time spent parsing `/proc/self/maps` under the runtime
+lock. In the reproduced stage, gameplay then ran near 60 FPS and cutscenes
+played at normal speed. This confirms one stage, not the complete campaign.
 
-Scenario Campaign initially loaded with missing scenery and nearly stopped.
-The updated guest-clock and memory-query settings were then tested in the same
-stage: scenery rendered, gameplay ran near 60 FPS, and cutscenes played at normal
-speed. This is a tested stage, not validation of the entire campaign.
-See [the Campaign investigation](docs/scenario-campaign.md) for details.
-The interlock path selected llvmpipe (software rendering) on this machine, so
-it is not a tested hardware alternative for this GPU.
+The launcher now uses a 60 Hz guest clock, fast GPU wait polling and FIFO
+presentation, without an additional guest swap limiter. `--legacy-timing`
+restores the SDK timing for comparison. `PROCMAP_QUERY` is used on supported
+Linux 6.11+ kernels; older kernels fall back to the parser and may perform worse.
+`REX_LINUX_LEGACY_MAP_QUERY=1` forces that parser for comparison. The SDK patch
+also fixes busy polling during fractional-millisecond POSIX waits.
 
-Linux 6.11+ supplies the direct `PROCMAP_QUERY` ioctl; older kernels fall back
-to the original `/proc/self/maps` parser. Set `REX_LINUX_LEGACY_MAP_QUERY=1` when
-launching to compare the parser path. The protection-query regression/benchmark
-can be run with:
+Vulkan framebuffer rendering is the default. `--fsi` requires fragment shader
+interlock; it selected llvmpipe software rendering on the test GPU and is not
+validated there as a hardware alternative. `--res 768x432`, `--offscreen 512`,
+`--fullscreen` and `--log` are available. Arguments after `--` go directly to
+the runtime. F3 toggles FPS; controls match the table below and game controllers
+use SDL3. The player name follows the Linux account username, within the guest
+name limit, while the saved profile identity stays the same. Online multiplayer
+is not included in this port.
 
-```sh
-cmake --build build/linux-amd64 --target tekken6_linux_memory_test
-build/linux-amd64/tekken6_linux_memory_test
-REX_LINUX_FAST_MAP_QUERY=1 build/linux-amd64/tekken6_linux_memory_test
-```
-
-The SDK patch also fixes CPU spinning during the final fraction of a timed
-POSIX wait. Its Linux regression check covers timeouts, wait-any, wait-all,
-and auto-reset event consumption, and reports CPU use:
-
-```sh
-cmake --build build/linux-amd64 --target tekken6_linux_wait_test
-build/linux-amd64/tekken6_linux_wait_test
-```
-
-### Standalone Linux app folder
-
-Create or update the app folder yourself with one command:
-
-```sh
-python3 tools/package_linux.py
-```
-
-This creates `build/Tekken6-Linux/Play.sh` together with the executable, required
-ReXGlue libraries, launcher, and your extracted game data. Move the complete
-folder and run `./Play.sh`. No compiler or SDK is needed to play; the destination
-still needs compatible Linux libraries and a Vulkan driver.
-
-Use `--build` to rebuild before packaging, `--output DIR` for another destination,
-and `--include-saves` to copy current saves on the first packaging. Re-running
-reuses unchanged game files and preserves existing packaged saves and caches.
-
-Developer profiling instructions and initial CPU/GPU measurements are in
-[Linux profiling](docs/linux-profiling.md).
+Optional profiling can be enabled with
+`TEKKEN6_GPU_PROFILE=/tmp/tekken6-gpu.csv tools/run_linux.sh --log`; analyze it
+with `python3 tools/analyze_gpu_profile.py /tmp/tekken6-gpu.csv`. Compare the same
+characters, stage, window size and active gameplay interval. CPU wall times
+include nested work, and GPU submission spans exclude presenter work and prior
+queueing; these counters are not a complete GPU bottleneck diagnosis. Initial
+Tunnel Disaster/Lightning Storm captures used older timing and mapping queries,
+so repeat captures with current defaults before comparing performance.
 
 ## macOS
 

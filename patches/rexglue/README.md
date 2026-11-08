@@ -35,4 +35,4 @@ versioned source of those changes. The helper checks the base revision and
 refuses to overwrite an SDK with conflicting edits.
 
 Optional Vulkan counters and asynchronous submission timestamps are enabled by
-`TEKKEN6_GPU_PROFILE`; see [Linux profiling](../../docs/linux-profiling.md).
+`TEKKEN6_GPU_PROFILE`; see [Linux progress and runtime options](../../README.md#linux-progress-and-runtime-options).

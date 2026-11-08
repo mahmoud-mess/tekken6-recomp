@@ -45,12 +45,11 @@ include(generated/rexglue.cmake)
 add_subdirectory(tools/xdvdfs)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_executable(tekken6_linux_wait_test EXCLUDE_FROM_ALL tools/tests/linux_waits.cpp)
-    target_link_libraries(tekken6_linux_wait_test PRIVATE rex::runtime)
-    add_executable(tekken6_linux_memory_test EXCLUDE_FROM_ALL tools/tests/linux_memory.cpp)
-    target_link_libraries(tekken6_linux_memory_test PRIVATE rex::runtime)
-    add_executable(tekken6_linux_profile_test EXCLUDE_FROM_ALL tools/tests/linux_profile.cpp)
-    target_link_libraries(tekken6_linux_profile_test PRIVATE rex::runtime)
+    # The distributable builder is independent of the guest/game targets.
+    add_executable(tekken6_builder EXCLUDE_FROM_ALL tools/linux_builder.cpp)
+    target_link_libraries(tekken6_builder PRIVATE SDL3::SDL3-static)
+    target_include_directories(tekken6_builder PRIVATE
+        "${REXSDK_DIR}/thirdparty/sdl3/src/render")
 endif()
 
 if(MINGW AND TARGET rexgpu-xenos)
