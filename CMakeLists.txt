@@ -21,6 +21,16 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("#include <expected>
+int main() { std::expected<int, int> value(1); return *value - 1; }"
+    TEKKEN6_HAS_STD_EXPECTED)
+if(NOT TEKKEN6_HAS_STD_EXPECTED)
+    message(FATAL_ERROR
+        "The compiler and C++ library must support C++23 std::expected. "
+        "On Ubuntu 24.04 use clang-19 and clang++-19.")
+endif()
+
 set(REXSDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rexglue-sdk"
     CACHE PATH "Pinned RexGlue SDK source tree")
 
@@ -33,6 +43,14 @@ include(generated/rexglue.cmake)
 
 # Small ISO inspection/extraction utility; game data remains local to the user.
 add_subdirectory(tools/xdvdfs)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # The distributable builder is independent of the guest/game targets.
+    add_executable(tekken6_builder EXCLUDE_FROM_ALL tools/linux_builder.cpp)
+    target_link_libraries(tekken6_builder PRIVATE SDL3::SDL3-static)
+    target_include_directories(tekken6_builder PRIVATE
+        "${REXSDK_DIR}/thirdparty/sdl3/src/render")
+endif()
 
 if(MINGW AND TARGET rexgpu-xenos)
     # Use the unprefixed module filename expected by the Windows plugin loader.
@@ -81,6 +99,15 @@ add_custom_target(tekken6_stage_gpu_plugin
     VERBATIM
 )
 add_dependencies(tekken6 tekken6_stage_gpu_plugin)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # The SDK gives the host an $ORIGIN RPATH, but its shared runtime is
+    # emitted in the SDK output directory. Stage it alongside the host too.
+    add_custom_command(TARGET tekken6 POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:rexruntime>" "$<TARGET_FILE_DIR:tekken6>"
+        VERBATIM
+    )
+endif()
 # Generated PPC code makes frequent explicit fused-multiply-add calls. FMA3
 # lowers these to hardware instructions while keeping implicit contraction off.
 if(TEKKEN6_ENABLE_FMA3)
@@ -89,11 +116,16 @@ if(TEKKEN6_ENABLE_FMA3)
     if(NOT TEKKEN6_COMPILER_HAS_MFMA)
         message(FATAL_ERROR "TEKKEN6_ENABLE_FMA3 requires compiler support for -mfma")
     endif()
-    target_compile_options(tekken6_recomp PRIVATE -mfma -ffp-contract=off)
+    # A fresh checkout has no guest target until codegen creates sources.cmake.
+    if(TARGET tekken6_recomp)
+        target_compile_options(tekken6_recomp PRIVATE -mfma -ffp-contract=off)
+    endif()
 endif()
-# The app sources include UI headers (including imgui.h) and instantiate UI
-# classes, so carry the UI target's public include path and object code here.
-target_link_libraries(tekken6 PRIVATE rex::ui)
+# Linux exports UI symbols from rexruntime and exposes their headers. Linking
+# the UI object library again duplicates its globals and cvar registrations.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(tekken6 PRIVATE rex::ui)
+endif()
 
 if(WIN32)
     configure_file(tools/portable_builder.rc.in
